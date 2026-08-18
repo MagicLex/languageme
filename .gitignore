@@ -1,0 +1,7 @@
+# mutable state lives outside the repo by default ($LANGUAGEME_HOME),
+# but ignore it here too in case someone points LANGUAGEME_HOME at the tree.
+state.json
+state.json.tmp
+.languageme/
+__pycache__/
+*.pyc

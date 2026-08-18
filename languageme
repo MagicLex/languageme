@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""languageme — a progressive language-immersion drip for Claude Code.
+
+Modeled on lex-claude's `lang` mechanism, but instead of "respond in X" it
+injects a *blend* preprompt ("render ~N% of your prose in Swedish"), then
+monitors the transcript to measure the real ratio produced and ramps N up on
+evidence (mastery-gated), not on a calendar.
+
+Standalone: one file, stdlib only, no pip installs. Wire it into Claude Code
+with `languageme install` (adds a SessionStart hook that injects the preprompt
+and a Stop hook that measures the finished turn).
+
+State lives in $LANGUAGEME_HOME (default ~/.languageme); the code is portable.
+"""
+
+import json
+import os
+import re
+import select
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths / state
+# ---------------------------------------------------------------------------
+
+HOME = Path(os.environ.get("LANGUAGEME_HOME", str(Path.home() / ".languageme")))
+STATE_PATH = HOME / "state.json"
+SELF_PATH = os.path.abspath(__file__)
+
+LANG_NAMES = {
+    "sv": "Swedish",
+    "lv": "Latvian",
+    "de": "German",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "nl": "Dutch",
+    "no": "Norwegian",
+    "da": "Danish",
+}
+
+# In-prose base language (what the *rest* of the reply stays in). Purely a label
+# used in the injected preprompt; the monitor never counts it as target.
+BASE_LANG_NAME = "French"
+
+DEFAULTS = {
+    "target": "sv",
+    "target_name": "Swedish",
+    "pct": 10,          # current blend target, integer percent
+    "goal": 40,         # ceiling to ramp toward
+    "floor": 5,         # never ramp below this
+    "step": 3,          # ramp increment / decrement
+    "help": "auto",     # auto | on | off
+    "ramp": "mastery",  # mastery | calendar | manual
+    "streak": 0,        # consecutive ready sessions (mastery mode)
+    "history": [],      # list of session measurements, most recent last
+    "sessions": {},     # session_id -> last processed transcript line index
+}
+
+HISTORY_CAP = 60
+SESSIONS_CAP = 25
+
+
+def load_state():
+    if STATE_PATH.exists():
+        try:
+            s = json.loads(STATE_PATH.read_text())
+        except Exception:
+            s = {}
+    else:
+        s = {}
+    merged = dict(DEFAULTS)
+    merged.update(s)
+    # target_name always tracks target
+    merged["target_name"] = LANG_NAMES.get(merged["target"], merged["target"])
+    return merged
+
+
+def save_state(s):
+    HOME.mkdir(parents=True, exist_ok=True)
+    s["history"] = s.get("history", [])[-HISTORY_CAP:]
+    # prune old session cursors
+    sess = s.get("sessions", {})
+    if len(sess) > SESSIONS_CAP:
+        # keep the most recently touched by insertion order
+        keys = list(sess.keys())[-SESSIONS_CAP:]
+        s["sessions"] = {k: sess[k] for k in keys}
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(s, ensure_ascii=False, indent=2))
+    tmp.replace(STATE_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Language classification (heuristic, char-weighted, stdlib only)
+#
+# FR / EN / SV are lexically well separated, so a curated stopword hit-rate per
+# sentence plus a diacritic signal classifies prose reliably without any ML
+# dependency. If accuracy ever falls short, swap classify_prose() for a call to
+# `lingua`; the rest of the tool is agnostic to how the ratio is produced.
+# ---------------------------------------------------------------------------
+
+SV_STOP = set("""
+och att det är jag en ett på för med inte som han hon den de vi du har kan ska
+till av om men så här där nu vad hur när var vara blir gör mycket lite bra tack
+hej då ja nej kanske eller också bara efter under över mellan utan mot vid genom
+sedan redan alltid aldrig ofta ibland väldigt ganska helt lite mer mindre flera
+några ingen inget inga varje denna detta dessa min din sin vår er deras honom
+henne dem oss er sig ju väl nog visst precis just liksom typ alltså därför
+eftersom fast trots dock ändå istället framför bakom bredvid hemma borta idag
+imorgon igår veckan året dagen natten morgon kväll skriva läsa förstå prata
+tala säga tänka veta tro känna behöva vilja måste finns fanns blev gjorde
+""".split())
+
+FR_STOP = set("""
+le la les un une des de du au aux et est sont être à dans par pour sur avec sans
+que qui quoi dont où ne pas plus moins très bien mal on je tu il elle nous vous
+ils elles me te se lui leur mon ton son ma ta sa mes tes ses notre votre ce cet
+cette ces mais ou donc car ni comme quand si alors aussi encore déjà toujours
+jamais souvent parfois ici là bas ceci cela ça faire fait dire voir savoir
+pouvoir vouloir devoir avoir parce puis ensuite avant après pendant chez vers
+""".split())
+
+EN_STOP = set("""
+the a an and or but is are was were be been to of in on for with without that
+this these those it its you your we our they their he she his her him them my me
+i not no yes very more less much many some any each every here there now then
+just also still already always never often sometimes because so if then when
+while what how which who whom whose do does did done make made say said see saw
+know knew think thought want need should would could can will shall
+""".split())
+
+# strong target-language letter; å is essentially unique to Nordic among the
+# languages Lex blends with, ä/ö are milder (also German). French never uses å.
+SV_CHARS = set("åäö")
+FR_CHARS = set("àâçéèêëîïôûùüÿœæ")  # distinctively French accents (no å)
+
+WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+SENT_SPLIT = re.compile(r"(?<=[.!?…:;])\s+|\n+")
+FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`]*`")
+URL_RE = re.compile(r"https?://\S+|\b[\w.-]+\.[a-z]{2,}(?:/\S*)?", re.IGNORECASE)
+
+
+def _strip_noise(text):
+    text = FENCE_RE.sub(" ", text)
+    text = INLINE_CODE_RE.sub(" ", text)
+    text = URL_RE.sub(" ", text)
+    return text
+
+
+def classify_prose(text):
+    """Return (target_chars, total_chars) — char-weighted target-language mass.
+
+    Target is Swedish by lexicon here; the stopword sets above define it. Only
+    natural prose counts: code fences, inline code and URLs are stripped first.
+    """
+    text = _strip_noise(text or "")
+    sv_chars = 0
+    total = 0
+    for sent in SENT_SPLIT.split(text):
+        sent = sent.strip()
+        if not sent:
+            continue
+        toks = [t.lower() for t in WORD_RE.findall(sent)]
+        if not toks:
+            continue
+        sv = sum(1 for t in toks if t in SV_STOP)
+        fr = sum(1 for t in toks if t in FR_STOP)
+        en = sum(1 for t in toks if t in EN_STOP)
+        low = sent.lower()
+        sv_char_hit = sum(1 for c in low if c in SV_CHARS)
+        fr_char_hit = sum(1 for c in low if c in FR_CHARS)
+        # å is a hard Swedish tell; ä/ö count only when no French accents present
+        if "å" in low:
+            sv += 2
+        elif sv_char_hit and not fr_char_hit:
+            sv += 1
+        fr += min(fr_char_hit, 3)
+        scores = {"sv": sv, "fr": fr, "en": en}
+        best = max(scores, key=scores.get)
+        weight = len(sent)
+        total += weight
+        # require a real signal; an all-unknown sentence is not counted as target
+        if best == "sv" and sv > 0:
+            sv_chars += weight
+    return sv_chars, total
+
+
+HELP_RE = re.compile(
+    r"traduis|translate|en fran[çc]ais|in english|what does|ça veut dire|"
+    r"c'?est quoi|comprends pas|understand|slower|plus lentement|"
+    r"trop de su[ée]dois|too much sw|för mycket",
+    re.IGNORECASE,
+)
+BACKOFF_RE = re.compile(
+    r"trop de su[ée]dois|too much sw|för mycket|slow down|ralentis|moins de su",
+    re.IGNORECASE,
+)
+MORE_RE = re.compile(r"\bplus de su[ée]dois\b|\bmore swedish\b|\bmer svenska\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsing
+# ---------------------------------------------------------------------------
+
+def read_stdin_json(timeout=0.2):
+    """Read a JSON object from stdin without ever blocking.
+
+    Hooks pipe JSON and close the pipe, so it's there immediately; a manual run
+    with no input returns {} after a short poll instead of hanging on EOF.
+    """
+    if sys.stdin.isatty():
+        return {}
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    except Exception:
+        return {}
+    if not ready:
+        return {}
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _blocks_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                out.append(b.get("text", ""))
+            elif isinstance(b, str):
+                out.append(b)
+        return "\n".join(out)
+    return ""
+
+
+def read_transcript(path, start_line=0):
+    """Yield (role, text) for assistant/user text messages from line start_line.
+
+    Returns (messages, total_lines). Defensive against schema drift.
+    """
+    p = Path(path)
+    if not p.exists():
+        return [], start_line
+    msgs = []
+    total = 0
+    with p.open(errors="replace") as fh:
+        for i, line in enumerate(fh):
+            total = i + 1
+            if i < start_line:
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            role = ev.get("type") or (ev.get("message") or {}).get("role")
+            if role not in ("assistant", "user"):
+                continue
+            msg = ev.get("message") or ev
+            text = _blocks_text(msg.get("content"))
+            if text.strip():
+                msgs.append((role, text))
+    return msgs, total
+
+
+# ---------------------------------------------------------------------------
+# Preprompt (the injected drip)
+# ---------------------------------------------------------------------------
+
+def build_preprompt(s):
+    tgt = s["target_name"]
+    pct = s["pct"]
+    help_mode = s["help"]
+    lines = [
+        "===== languageme (immersion drip) =====",
+        f"This session, render approximately {pct}% of your conversational prose "
+        f"in {tgt}; keep the rest in {BASE_LANG_NAME}. This is a gradual learning "
+        "drip — favour natural high-frequency vocabulary and everyday phrasing, "
+        "not obscure words.",
+        f"{tgt} belongs in chat prose ONLY. Never put it in code, identifiers, "
+        "commit messages, file contents, shell commands, tool arguments, or any "
+        "technical token where a wrong word breaks something.",
+        "Meaning must always stay recoverable: never hide an instruction, a "
+        "warning, or a precise technical claim behind untranslated "
+        f"{tgt}. When precision matters, keep that clause in {BASE_LANG_NAME}.",
+    ]
+    if help_mode == "on":
+        lines.append(
+            f"HELP=on: gloss every {tgt} phrase inline as `phrase (traduction)` "
+            "so nothing is ambiguous."
+        )
+    elif help_mode == "auto":
+        lines.append(
+            f"HELP=auto: gloss unfamiliar {tgt} words on first use as "
+            "`word (traduction)`, and let the glosses fade as the same words "
+            f"recur — at {pct}% you can drop glosses on words already seen."
+        )
+    else:  # off
+        lines.append(
+            f"HELP=off: no inline glosses — use {tgt} words in context clear "
+            "enough to infer, do not translate them."
+        )
+    lines.append(
+        "Do not announce or meta-comment the blend; just write naturally with "
+        f"{tgt} woven in. Tune the language rules above only for chat prose, "
+        "never at the expense of correctness in the actual work."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Ramp policy
+# ---------------------------------------------------------------------------
+
+def apply_ramp(s, measured_pct, self_pct, help_count, backoff, more):
+    """Mutate s['pct']/s['streak'] per ramp policy. Returns a short reason str."""
+    pct, goal, floor, step = s["pct"], s["goal"], s["floor"], s["step"]
+
+    # explicit natural-language control always wins, both directions
+    if backoff:
+        s["pct"] = max(floor, pct - step)
+        s["streak"] = 0
+        return f"backoff signal → {pct}%→{s['pct']}%"
+    if more and s["ramp"] != "manual":
+        s["pct"] = min(goal, pct + step)
+        s["streak"] = 0
+        return f"'more' signal → {pct}%→{s['pct']}%"
+
+    ramp = s["ramp"]
+    if ramp == "manual":
+        return "manual: pct unchanged"
+
+    if ramp == "calendar":
+        # one step per monitored session, capped
+        if pct < goal:
+            s["pct"] = min(goal, pct + step)
+            return f"calendar → {pct}%→{s['pct']}%"
+        return f"calendar: at goal {goal}%"
+
+    # mastery-gated: ramp only on evidence the drip is landing and not drowning.
+    hist = s["history"][-3:]
+    compiled = measured_pct >= 0.7 * pct           # I actually produced the blend
+    not_drowning = help_count == 0                 # he didn't ask for rescue
+    ready = compiled and not_drowning
+    if ready:
+        s["streak"] = s.get("streak", 0) + 1
+    else:
+        s["streak"] = 0
+        return (
+            f"hold {pct}% (streak reset: "
+            f"{'low output' if not compiled else ''}"
+            f"{'/' if not compiled and not not_drowning else ''}"
+            f"{'help asked' if not not_drowning else ''})"
+        )
+
+    # need 3 consecutive ready sessions, and enough history to trust it
+    need = 3
+    if s["streak"] >= need and pct < goal:
+        # faster step if he's writing the language himself
+        bump = step + (2 if self_pct >= min(pct * 0.3, 12) else 0)
+        s["pct"] = min(goal, pct + bump)
+        s["streak"] = 0
+        return f"mastery ✓ ({need} ready) → {pct}%→{s['pct']}%"
+    if pct >= goal:
+        return f"mastery: at goal {goal}%"
+    return f"mastery: streak {s['streak']}/{need}, hold {pct}%"
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_hook(args):
+    """SessionStart hook: print the preprompt to inject into context."""
+    # SessionStart delivers JSON on stdin; we don't need it, but draining it
+    # (without blocking) keeps the pipe tidy.
+    read_stdin_json()
+    s = load_state()
+    print(build_preprompt(s))
+    return 0
+
+
+def cmd_monitor(args):
+    """Stop hook: measure the finished turn, update ratio + ramp."""
+    # A manual --session run needs no stdin; only the hook path reads it.
+    if "--session" in args:
+        stdin_json = {}
+        transcript = args[args.index("--session") + 1]
+    else:
+        stdin_json = read_stdin_json()
+        transcript = stdin_json.get("transcript_path")
+    session_id = stdin_json.get("session_id", "manual")
+    if not transcript:
+        # nothing to measure (manual run without a session) — no-op, not an error
+        if "--quiet" not in args:
+            print("languageme: no transcript to measure", file=sys.stderr)
+        return 0
+
+    s = load_state()
+    start = 0 if "--full" in args else s.get("sessions", {}).get(session_id, 0)
+    msgs, total_lines = read_transcript(transcript, start)
+    s.setdefault("sessions", {})[session_id] = total_lines
+
+    a_sv = a_tot = u_sv = u_tot = help_count = 0
+    backoff = more = False
+    for role, text in msgs:
+        if role == "assistant":
+            sv, tot = classify_prose(text)
+            a_sv += sv
+            a_tot += tot
+        else:  # user
+            sv, tot = classify_prose(text)
+            u_sv += sv
+            u_tot += tot
+            if HELP_RE.search(text):
+                help_count += 1
+            if BACKOFF_RE.search(text):
+                backoff = True
+            if MORE_RE.search(text):
+                more = True
+
+    measured = round(100 * a_sv / a_tot, 1) if a_tot else 0.0
+    self_pct = round(100 * u_sv / u_tot, 1) if u_tot else 0.0
+
+    prev_pct = s["pct"]
+    reason = apply_ramp(s, measured, self_pct, help_count, backoff, more)
+
+    s["history"].append({
+        "session": session_id[:8],
+        "target": s["target"],
+        "pct_target": prev_pct,
+        "measured": measured,
+        "self": self_pct,
+        "help": help_count,
+        "new_target": s["pct"],
+    })
+    save_state(s)
+
+    if "--quiet" not in args:
+        arrow = "↑" if s["pct"] > prev_pct else ("↓" if s["pct"] < prev_pct else "=")
+        print(
+            f"languageme [{s['target']}] measured {measured}% "
+            f"(target {prev_pct}%, self {self_pct}%, help {help_count}) "
+            f"→ {s['pct']}%{arrow}  |  {reason}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_status(args):
+    s = load_state()
+    print(f"target     : {s['target']} ({s['target_name']})")
+    print(f"blend      : {s['pct']}%  (floor {s['floor']} · goal {s['goal']} · step {s['step']})")
+    print(f"ramp       : {s['ramp']}   help: {s['help']}   streak: {s.get('streak', 0)}")
+    hist = s.get("history", [])
+    if hist:
+        last = hist[-3:]
+        print("recent     :")
+        for h in last:
+            print(
+                f"  {h['session']}  target {h['pct_target']}%  "
+                f"measured {h['measured']}%  self {h['self']}%  help {h['help']}"
+                f"  → {h['new_target']}%"
+            )
+        avg = round(sum(h["measured"] for h in last) / len(last), 1)
+        print(f"avg measured (last {len(last)}): {avg}%")
+    else:
+        print("recent     : (no measurements yet — run a session, or `languageme monitor --session <transcript>`)")
+    wired = _is_installed()
+    print(f"hooks      : {'wired' if wired else 'NOT wired (run: languageme install)'}")
+    print(f"state      : {STATE_PATH}")
+    return 0
+
+
+def cmd_statusline(args):
+    s = load_state()
+    hist = s.get("history", [])
+    arrow = ""
+    if len(hist) >= 1:
+        h = hist[-1]
+        if h["new_target"] > h["pct_target"]:
+            arrow = "↑"
+        elif h["new_target"] < h["pct_target"]:
+            arrow = "↓"
+        m = f" ~{h['measured']:.0f}"
+    else:
+        m = ""
+    print(f"{s['target']} {s['pct']}%{arrow}{m}")
+    return 0
+
+
+def cmd_init(args):
+    lang = args[0] if args else "sv"
+    if lang not in LANG_NAMES:
+        print(f"languageme: unknown language '{lang}'. Known: {', '.join(LANG_NAMES)}",
+              file=sys.stderr)
+        # still allow it — target_name falls back to the code
+    s = load_state()
+    s["target"] = lang
+    s["target_name"] = LANG_NAMES.get(lang, lang)
+    s.setdefault("pct", DEFAULTS["pct"])
+    save_state(s)
+    print(f"languageme: target set to {lang} ({s['target_name']}), blend {s['pct']}%")
+    if lang != "sv":
+        print("note: the prose classifier ships Swedish/French/English lexicons. "
+              "Measurement of other targets needs their stopword set added to the "
+              "script (SV_STOP-style). The drip/preprompt works for any language.",
+              file=sys.stderr)
+    return 0
+
+
+def cmd_lang(args):
+    if not args:
+        print(load_state()["target"])
+        return 0
+    return cmd_init(args)
+
+
+def cmd_set(args):
+    s = load_state()
+    if not args:
+        print("usage: languageme set <pct|goal|floor|step> <n>", file=sys.stderr)
+        return 1
+    key = args[0]
+    if key not in ("pct", "goal", "floor", "step"):
+        print(f"languageme: cannot set '{key}'", file=sys.stderr)
+        return 1
+    try:
+        val = int(args[1])
+    except (IndexError, ValueError):
+        print("languageme: need an integer", file=sys.stderr)
+        return 1
+    s[key] = max(0, min(100, val))
+    save_state(s)
+    print(f"languageme: {key} = {s[key]}%")
+    return 0
+
+
+def cmd_bump(args):
+    s = load_state()
+    delta = int(args[0]) if args else s["step"]
+    s["pct"] = max(s["floor"], min(s["goal"], s["pct"] + delta))
+    s["streak"] = 0
+    save_state(s)
+    print(f"languageme: blend now {s['pct']}%")
+    return 0
+
+
+def cmd_help_mode(args):
+    if not args or args[0] not in ("on", "off", "auto"):
+        print("usage: languageme help <on|off|auto>", file=sys.stderr)
+        return 1
+    s = load_state()
+    s["help"] = args[0]
+    save_state(s)
+    print(f"languageme: help = {s['help']}")
+    return 0
+
+
+def cmd_ramp(args):
+    if not args or args[0] not in ("mastery", "calendar", "manual"):
+        print("usage: languageme ramp <mastery|calendar|manual>", file=sys.stderr)
+        return 1
+    s = load_state()
+    s["ramp"] = args[0]
+    save_state(s)
+    print(f"languageme: ramp = {s['ramp']}")
+    return 0
+
+
+def cmd_goal(args):
+    return cmd_set(["goal"] + list(args))
+
+
+# ---------------------------------------------------------------------------
+# install / uninstall (Claude Code hooks)
+# ---------------------------------------------------------------------------
+
+SETTINGS_PATH = Path(os.environ.get(
+    "CLAUDE_SETTINGS", str(Path.home() / ".claude" / "settings.json")))
+HOOK_MARKER = SELF_PATH  # our command is identifiable by the absolute script path
+
+
+def _load_settings():
+    if SETTINGS_PATH.exists():
+        try:
+            return json.loads(SETTINGS_PATH.read_text())
+        except Exception as e:
+            print(f"languageme: cannot parse {SETTINGS_PATH}: {e}", file=sys.stderr)
+            sys.exit(1)
+    return {}
+
+
+def _is_installed():
+    st = _load_settings()
+    blob = json.dumps(st.get("hooks", {}))
+    return HOOK_MARKER in blob
+
+
+def _add_hook(hooks, event, command, matcher=None):
+    entry = {"hooks": [{"type": "command", "command": command}]}
+    if matcher is not None:
+        entry["matcher"] = matcher
+    arr = hooks.setdefault(event, [])
+    # idempotent: skip if our command already present under this event
+    for grp in arr:
+        for h in grp.get("hooks", []):
+            if h.get("command") == command:
+                return False
+    arr.append(entry)
+    return True
+
+
+def cmd_install(args):
+    st = _load_settings()
+    hooks = st.setdefault("hooks", {})
+    changed = False
+    changed |= _add_hook(hooks, "SessionStart", f'"{SELF_PATH}" hook')
+    changed |= _add_hook(hooks, "Stop", f'"{SELF_PATH}" monitor --quiet', matcher="")
+    if not changed:
+        print("languageme: hooks already wired.")
+        return 0
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SETTINGS_PATH.exists():
+        bak = SETTINGS_PATH.with_suffix(".json.languageme.bak")
+        bak.write_text(SETTINGS_PATH.read_text())
+    SETTINGS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+    print(f"languageme: wired SessionStart + Stop hooks in {SETTINGS_PATH}")
+    print("             (existing lex-claude hooks are left untouched)")
+    print("Start a new Claude Code session to load the drip.")
+    return 0
+
+
+def cmd_uninstall(args):
+    st = _load_settings()
+    hooks = st.get("hooks", {})
+    removed = False
+    for event in ("SessionStart", "Stop"):
+        arr = hooks.get(event, [])
+        new = []
+        for grp in arr:
+            grp_hooks = [h for h in grp.get("hooks", [])
+                         if HOOK_MARKER not in h.get("command", "")]
+            if grp_hooks:
+                grp["hooks"] = grp_hooks
+                new.append(grp)
+            elif grp.get("hooks"):
+                removed = True  # dropped a whole group that was only ours
+        if len(new) != len(arr):
+            removed = True
+        hooks[event] = new
+    if not removed:
+        print("languageme: no hooks to remove.")
+        return 0
+    SETTINGS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+    print(f"languageme: removed hooks from {SETTINGS_PATH}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+USAGE = """languageme — progressive language-immersion drip for Claude Code
+
+  languageme init <lang>        seed a target language (default sv / Swedish)
+  languageme status             show target, blend %, recent measurements, ramp
+  languageme statusline         compact string for a statusline (e.g. "sv 12%↑")
+
+  languageme hook               [SessionStart] print the preprompt to inject
+  languageme monitor            [Stop] measure the finished turn, ramp the %
+      --session <path>            measure a specific transcript (manual)
+      --full                      re-measure the whole transcript, not just new lines
+      --quiet                     suppress the stderr report
+
+  languageme set pct|goal|floor|step <n>   tune the numbers
+  languageme bump [+n]          nudge the blend now (default = one step)
+  languageme goal <n>           set the ceiling to ramp toward
+  languageme help on|off|auto   inline-gloss policy
+  languageme ramp mastery|calendar|manual   how the % grows
+  languageme lang [<code>]      show / switch target language
+
+  languageme install            wire the two hooks into ~/.claude/settings.json
+  languageme uninstall          remove them
+
+State: {state}
+""".format(state=STATE_PATH)
+
+DISPATCH = {
+    "init": cmd_init,
+    "status": cmd_status,
+    "statusline": cmd_statusline,
+    "hook": cmd_hook,
+    "monitor": cmd_monitor,
+    "set": cmd_set,
+    "bump": cmd_bump,
+    "goal": cmd_goal,
+    "help": cmd_help_mode,
+    "ramp": cmd_ramp,
+    "lang": cmd_lang,
+    "install": cmd_install,
+    "uninstall": cmd_uninstall,
+}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help") and len(argv) == 1:
+        sys.stdout.write(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    fn = DISPATCH.get(cmd)
+    if not fn:
+        sys.stderr.write(f"languageme: unknown command '{cmd}'\n\n")
+        sys.stdout.write(USAGE)
+        return 1
+    return fn(rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
