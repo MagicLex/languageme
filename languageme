@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """languageme — a progressive language-immersion drip for Claude Code.
 
-Modeled on lex-claude's `lang` mechanism, but instead of "respond in X" it
-injects a *blend* preprompt ("render ~N% of your prose in Swedish"), then
+Instead of a hard "respond in X" switch, it injects a *blend* preprompt
+("render ~N% of your prose in Swedish, the rest in your usual language"), then
 monitors the transcript to measure the real ratio produced and ramps N up on
 evidence (mastery-gated), not on a calendar.
 
 Standalone: one file, stdlib only, no pip installs. Wire it into Claude Code
-with `languageme install` (adds a SessionStart hook that injects the preprompt
-and a Stop hook that measures the finished turn).
+with `languageme install`: a SessionStart hook that injects the preprompt, a
+Stop hook that measures the finished turn, and a statusline segment that
+augments whatever statusline you already have (never replaces it).
 
 State lives in $LANGUAGEME_HOME (default ~/.languageme); the code is portable.
 """
@@ -17,6 +18,7 @@ import json
 import os
 import re
 import select
+import subprocess
 import sys
 from pathlib import Path
 
@@ -40,10 +42,6 @@ LANG_NAMES = {
     "da": "Danish",
 }
 
-# In-prose base language (what the *rest* of the reply stays in). Purely a label
-# used in the injected preprompt; the monitor never counts it as target.
-BASE_LANG_NAME = "French"
-
 DEFAULTS = {
     "target": "sv",
     "target_name": "Swedish",
@@ -56,6 +54,7 @@ DEFAULTS = {
     "streak": 0,        # consecutive ready sessions (mastery mode)
     "history": [],      # list of session measurements, most recent last
     "sessions": {},     # session_id -> last processed transcript line index
+    "inner_statusline": None,  # the statusline command we wrap (None = we added a fresh one)
 }
 
 HISTORY_CAP = 60
@@ -130,10 +129,11 @@ while what how which who whom whose do does did done make made say said see saw
 know knew think thought want need should would could can will shall
 """.split())
 
-# strong target-language letter; å is essentially unique to Nordic among the
-# languages Lex blends with, ä/ö are milder (also German). French never uses å.
+# strong target-language letters; å is essentially unique to Nordic scripts,
+# ä/ö are milder (also German). Romance-language accents below never include å,
+# so they help tell a Swedish diacritic apart from a French/base-language one.
 SV_CHARS = set("åäö")
-FR_CHARS = set("àâçéèêëîïôûùüÿœæ")  # distinctively French accents (no å)
+BASE_CHARS = set("àâçéèêëîïôûùüÿœæ")  # Romance/base-language accents (no å)
 
 WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 SENT_SPLIT = re.compile(r"(?<=[.!?…:;])\s+|\n+")
@@ -170,13 +170,13 @@ def classify_prose(text):
         en = sum(1 for t in toks if t in EN_STOP)
         low = sent.lower()
         sv_char_hit = sum(1 for c in low if c in SV_CHARS)
-        fr_char_hit = sum(1 for c in low if c in FR_CHARS)
-        # å is a hard Swedish tell; ä/ö count only when no French accents present
+        base_char_hit = sum(1 for c in low if c in BASE_CHARS)
+        # å is a hard Swedish tell; ä/ö count only with no base-language accents
         if "å" in low:
             sv += 2
-        elif sv_char_hit and not fr_char_hit:
+        elif sv_char_hit and not base_char_hit:
             sv += 1
-        fr += min(fr_char_hit, 3)
+        fr += min(base_char_hit, 3)
         scores = {"sv": sv, "fr": fr, "en": en}
         best = max(scores, key=scores.get)
         weight = len(sent)
@@ -284,26 +284,27 @@ def build_preprompt(s):
     lines = [
         "===== languageme (immersion drip) =====",
         f"This session, render approximately {pct}% of your conversational prose "
-        f"in {tgt}; keep the rest in {BASE_LANG_NAME}. This is a gradual learning "
-        "drip — favour natural high-frequency vocabulary and everyday phrasing, "
-        "not obscure words.",
+        f"in {tgt}; keep the rest in your usual reply language (whatever you would "
+        "normally answer in, do not switch it). This is a gradual learning drip, "
+        "favour natural high-frequency vocabulary and everyday phrasing, not "
+        "obscure words.",
         f"{tgt} belongs in chat prose ONLY. Never put it in code, identifiers, "
         "commit messages, file contents, shell commands, tool arguments, or any "
         "technical token where a wrong word breaks something.",
         "Meaning must always stay recoverable: never hide an instruction, a "
         "warning, or a precise technical claim behind untranslated "
-        f"{tgt}. When precision matters, keep that clause in {BASE_LANG_NAME}.",
+        f"{tgt}. When precision matters, keep that clause in your usual language.",
     ]
     if help_mode == "on":
         lines.append(
-            f"HELP=on: gloss every {tgt} phrase inline as `phrase (traduction)` "
+            f"HELP=on: gloss every {tgt} phrase inline as `phrase (translation)` "
             "so nothing is ambiguous."
         )
     elif help_mode == "auto":
         lines.append(
             f"HELP=auto: gloss unfamiliar {tgt} words on first use as "
-            "`word (traduction)`, and let the glosses fade as the same words "
-            f"recur — at {pct}% you can drop glosses on words already seen."
+            "`word (translation)`, and let the glosses fade as the same words "
+            f"recur, at {pct}% you can drop glosses on words already seen."
         )
     else:  # off
         lines.append(
@@ -476,26 +477,53 @@ def cmd_status(args):
         print(f"avg measured (last {len(last)}): {avg}%")
     else:
         print("recent     : (no measurements yet — run a session, or `languageme monitor --session <transcript>`)")
-    wired = _is_installed()
-    print(f"hooks      : {'wired' if wired else 'NOT wired (run: languageme install)'}")
+    st = _load_settings()
+    hooks_wired = HOOK_MARKER in json.dumps(st.get("hooks", {}))
+    sl_wired = _is_statusline_wired(st)
+    print(f"hooks      : {'wired' if hooks_wired else 'NOT wired (run: languageme install)'}")
+    print(f"statusline : {'wired (segment: ' + _segment(s) + ')' if sl_wired else 'NOT wired'}")
     print(f"state      : {STATE_PATH}")
     return 0
 
 
-def cmd_statusline(args):
-    s = load_state()
+def _segment(s):
+    """The languageme statusline segment, e.g. 'sv 12%↑ ~11'."""
     hist = s.get("history", [])
     arrow = ""
-    if len(hist) >= 1:
+    m = ""
+    if hist:
         h = hist[-1]
         if h["new_target"] > h["pct_target"]:
             arrow = "↑"
         elif h["new_target"] < h["pct_target"]:
             arrow = "↓"
         m = f" ~{h['measured']:.0f}"
-    else:
-        m = ""
-    print(f"{s['target']} {s['pct']}%{arrow}{m}")
+    return f"{s['target']} {s['pct']}%{arrow}{m}"
+
+
+def cmd_statusline(args):
+    s = load_state()
+    if "--wrap" not in args:
+        print(_segment(s))
+        return 0
+    # --wrap: augment the pre-existing statusline instead of replacing it.
+    # Claude Code pipes session JSON on stdin; forward it verbatim to the inner
+    # command (which may need it) and append our segment.
+    data = "" if sys.stdin.isatty() else sys.stdin.read()
+    parts = []
+    inner = s.get("inner_statusline")
+    if inner:
+        try:
+            out = subprocess.run(
+                inner, shell=True, input=data,
+                capture_output=True, text=True, timeout=5,
+            ).stdout.rstrip("\n")
+            if out:
+                parts.append(out)
+        except Exception:
+            pass  # a broken inner statusline must never blank the whole line
+    parts.append(_segment(s))
+    print("  │  ".join(p for p in parts if p))
     return 0
 
 
@@ -601,12 +629,6 @@ def _load_settings():
     return {}
 
 
-def _is_installed():
-    st = _load_settings()
-    blob = json.dumps(st.get("hooks", {}))
-    return HOOK_MARKER in blob
-
-
 def _add_hook(hooks, event, command, matcher=None):
     entry = {"hooks": [{"type": "command", "command": command}]}
     if matcher is not None:
@@ -621,28 +643,70 @@ def _add_hook(hooks, event, command, matcher=None):
     return True
 
 
+def _statusline_command():
+    return f'"{SELF_PATH}" statusline --wrap'
+
+
+def _is_statusline_wired(st):
+    cur = st.get("statusLine")
+    cmd = cur.get("command") if isinstance(cur, dict) else None
+    return bool(cmd and SELF_PATH in cmd and "statusline" in cmd)
+
+
+def _wire_statusline(st, s):
+    """Point statusLine at our wrapper, remembering the existing command so the
+    wrapper can delegate to it. If there is none, we add a fresh one. Never
+    edits or replaces the inner statusline itself."""
+    if _is_statusline_wired(st):
+        return False  # already wrapped, idempotent (don't re-capture ourselves)
+    cur = st.get("statusLine")
+    inner = cur.get("command") if isinstance(cur, dict) else None
+    s["inner_statusline"] = inner  # None means we're adding a fresh statusline
+    st["statusLine"] = {"type": "command", "command": _statusline_command()}
+    return True
+
+
+def _unwire_statusline(st, s):
+    if not _is_statusline_wired(st):
+        return False  # not ours (or replaced by something else) — leave it be
+    inner = s.get("inner_statusline")
+    if inner:
+        st["statusLine"] = {"type": "command", "command": inner}
+    else:
+        st.pop("statusLine", None)
+    return True
+
+
 def cmd_install(args):
     st = _load_settings()
+    s = load_state()
     hooks = st.setdefault("hooks", {})
     changed = False
     changed |= _add_hook(hooks, "SessionStart", f'"{SELF_PATH}" hook')
     changed |= _add_hook(hooks, "Stop", f'"{SELF_PATH}" monitor --quiet', matcher="")
+    sl_changed = _wire_statusline(st, s)
+    changed |= sl_changed
     if not changed:
-        print("languageme: hooks already wired.")
+        print("languageme: hooks and statusline already wired.")
         return 0
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     if SETTINGS_PATH.exists():
         bak = SETTINGS_PATH.with_suffix(".json.languageme.bak")
         bak.write_text(SETTINGS_PATH.read_text())
     SETTINGS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2))
+    if sl_changed:
+        save_state(s)  # persist inner_statusline
+    sl_note = ("augmented existing statusline"
+               if s.get("inner_statusline") else "added a statusline")
     print(f"languageme: wired SessionStart + Stop hooks in {SETTINGS_PATH}")
-    print("             (existing lex-claude hooks are left untouched)")
+    print(f"            statusline: {sl_note} (existing entries left untouched)")
     print("Start a new Claude Code session to load the drip.")
     return 0
 
 
 def cmd_uninstall(args):
     st = _load_settings()
+    s = load_state()
     hooks = st.get("hooks", {})
     removed = False
     for event in ("SessionStart", "Stop"):
@@ -659,11 +723,12 @@ def cmd_uninstall(args):
         if len(new) != len(arr):
             removed = True
         hooks[event] = new
+    removed |= _unwire_statusline(st, s)
     if not removed:
-        print("languageme: no hooks to remove.")
+        print("languageme: nothing to remove.")
         return 0
     SETTINGS_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2))
-    print(f"languageme: removed hooks from {SETTINGS_PATH}")
+    print(f"languageme: removed hooks + restored statusline in {SETTINGS_PATH}")
     return 0
 
 
@@ -675,7 +740,8 @@ USAGE = """languageme — progressive language-immersion drip for Claude Code
 
   languageme init <lang>        seed a target language (default sv / Swedish)
   languageme status             show target, blend %, recent measurements, ramp
-  languageme statusline         compact string for a statusline (e.g. "sv 12%↑")
+  languageme statusline         compact segment for a statusline (e.g. "sv 12%↑")
+      --wrap                      run the wrapped statusline, append our segment
 
   languageme hook               [SessionStart] print the preprompt to inject
   languageme monitor            [Stop] measure the finished turn, ramp the %
@@ -690,8 +756,8 @@ USAGE = """languageme — progressive language-immersion drip for Claude Code
   languageme ramp mastery|calendar|manual   how the % grows
   languageme lang [<code>]      show / switch target language
 
-  languageme install            wire the two hooks into ~/.claude/settings.json
-  languageme uninstall          remove them
+  languageme install            wire the hooks + statusline into settings.json
+  languageme uninstall          remove them, restore the original statusline
 
 State: {state}
 """.format(state=STATE_PATH)

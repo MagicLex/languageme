@@ -4,23 +4,29 @@ A progressive language-immersion drip for Claude Code. It preprompts, forces
 and monitors how much of each reply comes back in a target language, and ramps
 that share up on evidence you're keeping up, not on a calendar.
 
-Standalone: one Python file, stdlib only, no pip installs. Modeled on the
-`lex-claude` lang mechanism, but a *blend* instead of a hard switch.
+Standalone: one Python file, stdlib only, no pip installs. A *blend* drip, not
+a hard language switch.
 
 ## How it works
 
-Three layers, wired as two Claude Code hooks:
+Three layers, wired as two Claude Code hooks plus a statusline segment:
 
 - **Preprompt (SessionStart hook).** `languageme hook` injects "render ~N% of
-  your prose in Swedish, the rest in French" into every new session. N lives in
-  state. Swedish is confined to chat prose. never code, commits, filenames,
-  tool arguments, or any clause where a wrong word breaks something.
+  your prose in Swedish, keep the rest in your usual reply language" into every
+  new session. N lives in state. The target language is confined to chat prose,
+  never code, commits, filenames, tool arguments, or any clause where a wrong
+  word breaks something.
 - **Force.** The injected rule is explicit and self-limiting: meaning stays
-  recoverable, precise technical claims stay in the base language.
+  recoverable, precise technical claims stay in your usual language.
 - **Monitor (Stop hook).** `languageme monitor` reads the finished transcript,
   measures the *real* target-language share you produced (char-weighted,
   sentence-level classifier, no ML dependency), tracks whether you asked for
   help or wrote the language yourself, and moves N per the ramp policy.
+
+A **statusline segment** (`sv 12%↑ ~11`: target, current blend, last measured)
+rides along so you always see where the dial is. `install` wires it
+non-destructively: if you already have a statusline it wraps it and appends the
+segment, if you don't it adds one. It never edits or replaces your statusline.
 
 The blend only ever grows when the drip is landing and you're not drowning.
 
@@ -28,7 +34,7 @@ The blend only ever grows when the drip is landing and you're not drowning.
 
 ```sh
 ./languageme init sv          # seed Swedish at 10%
-./languageme install          # wire the two hooks (edits ~/.claude/settings.json)
+./languageme install          # wire hooks + statusline (edits ~/.claude/settings.json)
 # start a new Claude Code session, the drip is live
 ./languageme status           # target, blend %, recent measurements, ramp state
 ```
@@ -51,7 +57,7 @@ Natural-language overrides always win, both directions: say "trop de suédois"
 
 ## Help modes (`languageme help <mode>`)
 
-- **auto** (default). Glosses new words as `word (traduction)` on first use,
+- **auto** (default). Glosses new words as `word (translation)` on first use,
   fades as they recur.
 - **on.** Every target phrase glossed. zero ambiguity, slower learning.
 - **off.** Raw, infer from context.
@@ -61,7 +67,7 @@ Natural-language overrides always win, both directions: say "trop de suédois"
 ```
 init <lang>                 seed a target language (sv, lv, de, es, it, ...)
 status                      full state readout
-statusline                  compact string, e.g. "sv 12%↑ ~11"
+statusline [--wrap]         compact segment; --wrap runs the wrapped statusline too
 hook                        [SessionStart] print the preprompt
 monitor [--session P]       [Stop] measure a turn, ramp the %
         [--full] [--quiet]  re-measure whole transcript / silence the report
@@ -71,7 +77,7 @@ goal <n>                    ceiling to ramp toward
 help on|off|auto            inline-gloss policy
 ramp mastery|calendar|manual
 lang [<code>]               show / switch target
-install | uninstall         wire / unwire the Claude Code hooks
+install | uninstall         wire / unwire hooks + statusline
 ```
 
 ## State
@@ -82,9 +88,11 @@ settings to `settings.json.languageme.bak` before its first edit.
 
 ## Notes
 
-- The prose classifier ships Swedish / French / English lexicons. Measurement
-  of another target needs its stopword set added to the script (the `SV_STOP`
-  block). the drip and preprompt work for any language out of the box, only the
-  *measurement* half is lexicon-bound.
-- `install` appends its hook entries; it never touches existing hooks (e.g.
-  lex-claude's). `uninstall` removes only its own.
+- The prose classifier ships a Swedish lexicon plus French and English
+  discriminators for the non-target bucket. Measuring another target needs its
+  stopword set added to the script (the `SV_STOP` block). The drip and preprompt
+  work for any language out of the box, only the *measurement* half is
+  lexicon-bound.
+- `install` appends its hook entries and wraps (never replaces) your statusline;
+  it leaves every existing hook and statusline untouched. `uninstall` removes
+  only its own and restores the original statusline.
