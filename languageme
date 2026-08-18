@@ -20,7 +20,13 @@ import re
 import select
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: locking degrades to a best-effort no-op
+    fcntl = None
 
 # ---------------------------------------------------------------------------
 # Paths / state
@@ -74,6 +80,26 @@ def load_state():
     # target_name always tracks target
     merged["target_name"] = LANG_NAMES.get(merged["target"], merged["target"])
     return merged
+
+
+@contextmanager
+def state_lock():
+    """Serialize read-modify-write of state across concurrent sessions, so two
+    Stop hooks firing at once can't clobber each other's append. Best-effort:
+    a no-op where fcntl is unavailable (non-POSIX)."""
+    HOME.mkdir(parents=True, exist_ok=True)
+    fh = open(HOME / ".lock", "w")
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        fh.close()
 
 
 def save_state(s):
@@ -241,21 +267,22 @@ def _blocks_text(content):
     return ""
 
 
-def read_transcript(path, start_line=0):
-    """Yield (role, text) for assistant/user text messages from line start_line.
-
-    Returns (messages, total_lines). Defensive against schema drift.
+def read_transcript(path, start_byte=0):
+    """Return (messages, end_byte) for assistant/user text messages after
+    start_byte, seeking straight to the new tail so each Stop is O(new bytes),
+    not O(whole transcript). Defensive against schema drift and truncation.
     """
     p = Path(path)
     if not p.exists():
-        return [], start_line
+        return [], start_byte
+    size = p.stat().st_size
+    # transcript was replaced/truncated (e.g. /clear reused the path): re-read
+    if start_byte > size:
+        start_byte = 0
     msgs = []
-    total = 0
     with p.open(errors="replace") as fh:
-        for i, line in enumerate(fh):
-            total = i + 1
-            if i < start_line:
-                continue
+        fh.seek(start_byte)
+        for line in fh:
             line = line.strip()
             if not line:
                 continue
@@ -270,7 +297,8 @@ def read_transcript(path, start_line=0):
             text = _blocks_text(msg.get("content"))
             if text.strip():
                 msgs.append((role, text))
-    return msgs, total
+        end_byte = fh.tell()
+    return msgs, end_byte
 
 
 # ---------------------------------------------------------------------------
@@ -407,45 +435,50 @@ def cmd_monitor(args):
             print("languageme: no transcript to measure", file=sys.stderr)
         return 0
 
-    s = load_state()
-    start = 0 if "--full" in args else s.get("sessions", {}).get(session_id, 0)
-    msgs, total_lines = read_transcript(transcript, start)
-    s.setdefault("sessions", {})[session_id] = total_lines
-
+    # load→read tail→ramp→save under one lock so parallel Stop hooks can't
+    # clobber each other's append. The read is bounded to the new tail (byte
+    # seek), so holding the lock across it is cheap.
     a_sv = a_tot = u_sv = u_tot = help_count = 0
     backoff = more = False
-    for role, text in msgs:
-        if role == "assistant":
-            sv, tot = classify_prose(text)
-            a_sv += sv
-            a_tot += tot
-        else:  # user
-            sv, tot = classify_prose(text)
-            u_sv += sv
-            u_tot += tot
-            if HELP_RE.search(text):
-                help_count += 1
-            if BACKOFF_RE.search(text):
-                backoff = True
-            if MORE_RE.search(text):
-                more = True
 
-    measured = round(100 * a_sv / a_tot, 1) if a_tot else 0.0
-    self_pct = round(100 * u_sv / u_tot, 1) if u_tot else 0.0
+    with state_lock():
+        s = load_state()
+        start = 0 if "--full" in args else s.get("sessions", {}).get(session_id, 0)
+        msgs, end_byte = read_transcript(transcript, start)
+        s.setdefault("sessions", {})[session_id] = end_byte
 
-    prev_pct = s["pct"]
-    reason = apply_ramp(s, measured, self_pct, help_count, backoff, more)
+        for role, text in msgs:
+            if role == "assistant":
+                sv, tot = classify_prose(text)
+                a_sv += sv
+                a_tot += tot
+            else:  # user
+                sv, tot = classify_prose(text)
+                u_sv += sv
+                u_tot += tot
+                if HELP_RE.search(text):
+                    help_count += 1
+                if BACKOFF_RE.search(text):
+                    backoff = True
+                if MORE_RE.search(text):
+                    more = True
 
-    s["history"].append({
-        "session": session_id[:8],
-        "target": s["target"],
-        "pct_target": prev_pct,
-        "measured": measured,
-        "self": self_pct,
-        "help": help_count,
-        "new_target": s["pct"],
-    })
-    save_state(s)
+        measured = round(100 * a_sv / a_tot, 1) if a_tot else 0.0
+        self_pct = round(100 * u_sv / u_tot, 1) if u_tot else 0.0
+
+        prev_pct = s["pct"]
+        reason = apply_ramp(s, measured, self_pct, help_count, backoff, more)
+
+        s["history"].append({
+            "session": session_id[:8],
+            "target": s["target"],
+            "pct_target": prev_pct,
+            "measured": measured,
+            "self": self_pct,
+            "help": help_count,
+            "new_target": s["pct"],
+        })
+        save_state(s)
 
     if "--quiet" not in args:
         arrow = "↑" if s["pct"] > prev_pct else ("↓" if s["pct"] < prev_pct else "=")

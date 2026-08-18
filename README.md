@@ -96,3 +96,7 @@ settings to `settings.json.languageme.bak` before its first edit.
 - `install` appends its hook entries and wraps (never replaces) your statusline;
   it leaves every existing hook and statusline untouched. `uninstall` removes
   only its own and restores the original statusline.
+- Scales flat. State is bounded (history and session cursors are capped), each
+  Stop reads only the new transcript tail via a byte seek (not the whole file),
+  and the read-modify-write is `flock`-serialized so parallel Claude Code
+  sessions can't clobber each other's measurements.
