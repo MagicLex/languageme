@@ -20,8 +20,9 @@ Three layers, wired as two Claude Code hooks plus a statusline segment:
   recoverable, precise technical claims stay in your usual language.
 - **Monitor (Stop hook).** `languageme monitor` reads the finished transcript,
   measures the *real* target-language share you produced (char-weighted,
-  sentence-level classifier, no ML dependency), tracks whether you asked for
-  help or wrote the language yourself, and moves N per the ramp policy.
+  per-token classifier that reads the intra-sentence blend, no ML dependency),
+  tracks whether you asked for help or wrote the language yourself, and moves N
+  per the ramp policy.
 
 A **statusline segment** rides along so you always see where the dial is.
 Reading `sv 12%↑ ~11`:

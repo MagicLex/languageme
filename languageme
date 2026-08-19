@@ -137,8 +137,17 @@ def save_state(s):
 # "not target" bucket. Curated high-frequency stopwords plus a per-language
 # diacritic signal classify prose reliably for these lexically well-separated
 # languages, no ML dependency. To add a target, add its stopword set and its
-# distinctive characters to the two registries below. If accuracy ever falls
-# short, swap classify_prose() for a call to `lingua`; the rest of the tool is
+# distinctive characters to the two registries below.
+#
+# Attribution is per-TOKEN, not per-sentence, because a learner's blend is
+# intra-sentence code-switching ("Nu kollar jag on the file", "Klart (done)"),
+# not whole target-language sentences. Each token is decided from its lexicon +
+# diacritic signal; ambiguous words shared across languages (de, en) stay
+# undecided and inherit the language of their nearest decided neighbour, so a
+# content word attaches to the code-switched span it sits in. Char-weighted.
+# Blind spot: an isolated target content word with no diacritic and no decided
+# neighbour (bare "Klart") reads as non-target. If accuracy ever falls short,
+# swap classify_prose() for a call to `lingua`; the rest of the tool is
 # agnostic to how the ratio is produced.
 # ---------------------------------------------------------------------------
 
@@ -223,38 +232,78 @@ def _strip_noise(text):
     return text
 
 
+def _decide_token(tok):
+    """The language a single lowercased token points to, or None if it carries
+    no signal or an ambiguous one. A distinctive diacritic (å, ñ, ā...) decides
+    strongly; a stopword decides only if it belongs to exactly one lexicon, so
+    words shared across languages (de, en, a) stay undecided rather than guess.
+    """
+    scores = {}
+    for code, lex in LEXICONS.items():
+        sc = 2 if tok in lex else 0
+        chars = LANG_CHARS.get(code)
+        if chars:
+            sc += 3 * sum(1 for c in tok if c in chars)
+        if sc:
+            scores[code] = sc
+    if not scores:
+        return None
+    top = max(scores.values())
+    winners = [c for c, v in scores.items() if v == top]
+    return winners[0] if len(winners) == 1 else None
+
+
+def _classify_sentence(sent, target):
+    """(target_chars, total_chars) for one sentence, attributing every char to a
+    language by token runs. Undecided tokens inherit their nearest decided
+    neighbour; a sentence with no decided token contributes all its mass to the
+    'not target' bucket. Char weights sum to len(sent) (punctuation/space is
+    charged to the preceding token, leading chars to the first)."""
+    matches = list(WORD_RE.finditer(sent))
+    n = len(matches)
+    if not n:
+        return 0, 0
+    weights = [0] * n
+    for i, m in enumerate(matches):
+        nxt = matches[i + 1].start() if i + 1 < n else len(sent)
+        weights[i] = nxt - m.start()
+    weights[0] += matches[0].start()  # leading chars → first token
+
+    labels = [_decide_token(m.group().lower()) for m in matches]
+    # forward fill (attach to preceding decision), then backward for the lead run
+    last = None
+    for i in range(n):
+        if labels[i] is not None:
+            last = labels[i]
+        elif last is not None:
+            labels[i] = last
+    nxt = None
+    for i in range(n - 1, -1, -1):
+        if labels[i] is not None:
+            nxt = labels[i]
+        elif nxt is not None:
+            labels[i] = nxt
+
+    tgt = sum(w for w, lab in zip(weights, labels) if lab == target)
+    return tgt, sum(weights)
+
+
 def classify_prose(text, target):
     """Return (target_chars, total_chars): char-weighted mass of prose in the
-    target language. Each sentence is scored against every known lexicon plus a
-    per-language diacritic boost, and counts toward the target only when the
-    target wins with a real signal. Code fences, inline code and URLs stripped.
-    """
+    target language, attributed per token so an intra-sentence blend is measured
+    at the granularity it actually occurs. Code fences, inline code and URLs
+    stripped."""
     if target not in LEXICONS:
         return 0, 0
     text = _strip_noise(text or "")
     tgt_chars = 0
     total = 0
     for sent in SENT_SPLIT.split(text):
-        sent = sent.strip()
-        if not sent:
+        if not sent.strip():
             continue
-        toks = [t.lower() for t in WORD_RE.findall(sent)]
-        if not toks:
-            continue
-        low = sent.lower()
-        scores = {}
-        for code, lex in LEXICONS.items():
-            score = sum(1 for t in toks if t in lex)
-            chars = LANG_CHARS.get(code)
-            if chars:
-                score += min(sum(1 for c in low if c in chars), 3)
-            scores[code] = score
-        best = max(scores, key=scores.get)
-        weight = len(sent)
-        total += weight
-        # require a real signal; an all-unknown sentence is not counted as target
-        if best == target and scores[target] > 0:
-            tgt_chars += weight
+        st, tt = _classify_sentence(sent, target)
+        tgt_chars += st
+        total += tt
     return tgt_chars, total
 
 
