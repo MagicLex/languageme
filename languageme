@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""languageme — a progressive language-immersion drip for Claude Code.
+"""languageme: a progressive language-immersion drip for Claude Code.
 
 Instead of a hard "respond in X" switch, it injects a *blend* preprompt
 ("render ~N% of your prose in Swedish, the rest in your usual language"), then
@@ -485,7 +485,7 @@ def cmd_monitor(args):
         transcript = stdin_json.get("transcript_path")
     session_id = stdin_json.get("session_id", "manual")
     if not transcript:
-        # nothing to measure (manual run without a session) — no-op, not an error
+        # nothing to measure (manual run without a session): a no-op, not an error
         if "--quiet" not in args:
             print("languageme: no transcript to measure", file=sys.stderr)
         return 0
@@ -579,7 +579,7 @@ def cmd_status(args):
         avg = round(sum(h["measured"] for h in last) / len(last), 1)
         print(f"avg measured (last {len(last)}): {avg}%")
     else:
-        print("recent     : (no measurements yet — run a session, or `languageme monitor --session <transcript>`)")
+        print("recent     : (no measurements yet; run a session, or `languageme monitor --session <transcript>`)")
     st = _load_settings()
     hooks_wired = HOOK_MARKER in json.dumps(st.get("hooks", {}))
     sl_wired = _is_statusline_wired(st)
@@ -639,7 +639,7 @@ def cmd_init(args):
     if lang not in LANG_NAMES:
         print(f"languageme: unknown language '{lang}'. Known: {', '.join(LANG_NAMES)}",
               file=sys.stderr)
-        # still allow it — target_name falls back to the code
+        # still allow it: target_name falls back to the code
     s = load_state()
     s["target"] = lang
     s["target_name"] = LANG_NAMES.get(lang, lang)
@@ -811,7 +811,7 @@ def _wire_statusline(st, s):
 
 def _unwire_statusline(st, s):
     if not _is_statusline_wired(st):
-        return False  # not ours (or replaced by something else) — leave it be
+        return False  # not ours (or replaced by something else), leave it be
     inner = s.get("inner_statusline")
     if inner:
         st["statusLine"] = {"type": "command", "command": inner}
@@ -905,7 +905,7 @@ def cmd_update(args):
 # dispatch
 # ---------------------------------------------------------------------------
 
-USAGE = """languageme — progressive language-immersion drip for Claude Code
+USAGE = """languageme: progressive language-immersion drip for Claude Code
 
   languageme init <lang>        seed a target language (default sv / Swedish)
   languageme status             show target, blend %, recent measurements, ramp
