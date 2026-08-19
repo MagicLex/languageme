@@ -38,6 +38,8 @@ SELF_PATH = os.path.abspath(__file__)
 
 LANG_NAMES = {
     "sv": "Swedish",
+    "fr": "French",
+    "en": "English",
     "lv": "Latvian",
     "de": "German",
     "es": "Spanish",
