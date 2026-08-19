@@ -309,25 +309,58 @@ def classify_prose(text, target):
     return tgt_chars, total
 
 
-# The user asking for rescue from the immersion: switch back to the base
-# language, gloss a word, or say it is too much. Every branch is anchored to
-# that intent, so ordinary coding talk ("translate the config", "I don't
-# understand this trace", "what does this return", "the query is slower") does
-# NOT trip it and stall the mastery ramp. Bare verbs (translate/understand)
-# were the false positives; dropped in favour of switch-back and gloss phrasing.
-HELP_RE = re.compile(
-    r"\bin english\b|\ben fran[çc]ais\b|"                        # switch me back
-    r"\bwhat does\b[^.?!]{0,40}\bmean\b|\bça veut dire\b|\bc'?est quoi\b|"  # gloss a word
-    r"\bcomprends pas\b|\btraduis\b|"                            # explicit FR help
-    r"\bplus lentement\b|\bralentis\b|"                          # slow the pace
-    r"trop de su[ée]dois|too much swedish|för mycket",           # too much target
-    re.IGNORECASE,
+# The user steers the drip in natural language. The signals are language-aware,
+# built per target by _control_res(), so "too much spanish" works when learning
+# Spanish and "mer svenska" works when learning Swedish, not just hardcoded one
+# language. Two vocabularies feed the builder:
+#
+# CONTROL: per target, how the user refers to it (endonym plus the English and
+# French names, since the base reply language is one of those) and the target's
+# own words for "more" / "too much". A learner phrases control either in the
+# base language ("too much swedish", "trop de suédois") or in the target itself
+# ("mer svenska", "más español"), so both are matched.
+CONTROL = {
+    "sv": {"names": r"su[ée]dois|swedish|svenska",       "more": r"mer",       "toomuch": r"f[öo]r mycket"},
+    "fr": {"names": r"fran[çc]ais|french",               "more": r"plus de",   "toomuch": r"trop de"},
+    "en": {"names": r"anglais|english",                  "more": r"more",      "toomuch": r"too much"},
+    "es": {"names": r"espagnol|spanish|espa[ñn]ol",      "more": r"m[áa]s",    "toomuch": r"demasiado"},
+    "lv": {"names": r"letton|latvian|latvie[šs]u",       "more": r"vair[āa]k", "toomuch": r"par daudz"},
+}
+
+# Base-language help that never names the target: switch back to the base
+# language, or gloss a single word. Target-independent, anchored so ordinary
+# coding talk ("translate the config", "I don't understand this trace", "what
+# does this return") does not trip it and stall the mastery ramp.
+BASE_HELP = (
+    r"\bin english\b|\ben fran[çc]ais\b|"
+    r"\bwhat does\b[^.?!]{0,40}\bmean\b|\bça veut dire\b|\bc'?est quoi\b|"
+    r"\bcomprends pas\b|\btraduis\b"
 )
-BACKOFF_RE = re.compile(
-    r"trop de su[ée]dois|too much sw|för mycket|slow down|ralentis|moins de su",
-    re.IGNORECASE,
-)
-MORE_RE = re.compile(r"\bplus de su[ée]dois\b|\bmore swedish\b|\bmer svenska\b", re.IGNORECASE)
+# "slow the pace": French only; bare English "slow down" / "slower" collide
+# with coding talk ("slow down the retry loop", "the query got slower").
+BASE_PACE = r"\bplus lentement\b|\bralentis\b"
+
+_NEVER = re.compile(r"(?!)")  # matches nothing
+
+
+def _control_res(target):
+    """Build (help, backoff, more) matchers for a target. help = base-language
+    switch-back/gloss plus everything that means backoff. backoff = 'too much /
+    less <target>' (base and native) plus slow-the-pace. more = 'more <target>'
+    (base and native). A target with no CONTROL entry keeps base help + pace."""
+    c = CONTROL.get(target)
+    if not c:
+        return (re.compile(rf"{BASE_HELP}|{BASE_PACE}", re.IGNORECASE),
+                re.compile(BASE_PACE, re.IGNORECASE), _NEVER)
+    names = c["names"]
+    more_w = rf"more|plus de|{c['more']}"
+    less_w = rf"too much|trop de|less|moins de|{c['toomuch']}"
+    more = rf"\b(?:{more_w})\s+(?:{names})\b"
+    backoff = rf"\b(?:{less_w})\s+(?:{names})\b|{BASE_PACE}"
+    help_full = rf"{BASE_HELP}|{backoff}"
+    return (re.compile(help_full, re.IGNORECASE),
+            re.compile(backoff, re.IGNORECASE),
+            re.compile(more, re.IGNORECASE))
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +600,7 @@ def cmd_monitor(args):
         s.setdefault("sessions", {})[session_id] = end_byte
 
         target = s["target"]
+        help_re, backoff_re, more_re = _control_res(target)
         for role, text in msgs:
             if role == "assistant":
                 sv, tot = classify_prose(text, target)
@@ -576,11 +610,11 @@ def cmd_monitor(args):
                 sv, tot = classify_prose(text, target)
                 u_sv += sv
                 u_tot += tot
-                if HELP_RE.search(text):
+                if help_re.search(text):
                     help_count += 1
-                if BACKOFF_RE.search(text):
+                if backoff_re.search(text):
                     backoff = True
-                if MORE_RE.search(text):
+                if more_re.search(text):
                     more = True
 
         measured = round(100 * a_sv / a_tot, 1) if a_tot else 0.0

@@ -69,9 +69,13 @@ the new language.
   to whether you're keeping up.
 - **manual.** Never auto-moves. You bump it: `languageme bump +5`.
 
-Natural-language overrides always win, both directions: say "trop de suédois"
-(or "för mycket") in chat and the next monitor pass steps the blend *down*; say
-"plus de suédois" and it steps up.
+Natural-language overrides always win, both directions, and they are
+language-aware. Say "too much swedish" (or the target's own words, "för mycket
+svenska", "demasiado español", "trop de français") in chat and the next monitor
+pass steps the blend *down*; say "more swedish" / "mer svenska" / "más español"
+and it steps up. Asking to switch back ("in english", "en français") or to
+gloss a word ("what does X mean") counts as needing help and holds the ramp.
+Ordinary coding talk ("translate the config", "the query got slower") does not.
 
 ## Help modes (`languageme help <mode>`)
 
