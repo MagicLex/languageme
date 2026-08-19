@@ -141,3 +141,7 @@ settings to `settings.json.languageme.bak` before its first edit.
   Stop reads only the new transcript tail via a byte seek (not the whole file),
   and the read-modify-write is `flock`-serialized so parallel Claude Code
   sessions can't clobber each other's measurements.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Use it, fork it, ship it.
