@@ -133,10 +133,13 @@ def save_state(s):
 # ---------------------------------------------------------------------------
 # Language classification (heuristic, char-weighted, stdlib only)
 #
-# FR / EN / SV are lexically well separated, so a curated stopword hit-rate per
-# sentence plus a diacritic signal classifies prose reliably without any ML
-# dependency. If accuracy ever falls short, swap classify_prose() for a call to
-# `lingua`; the rest of the tool is agnostic to how the ratio is produced.
+# Each target ships a stopword lexicon; the other lexicons discriminate the
+# "not target" bucket. Curated high-frequency stopwords plus a per-language
+# diacritic signal classify prose reliably for these lexically well-separated
+# languages, no ML dependency. To add a target, add its stopword set and its
+# distinctive characters to the two registries below. If accuracy ever falls
+# short, swap classify_prose() for a call to `lingua`; the rest of the tool is
+# agnostic to how the ratio is produced.
 # ---------------------------------------------------------------------------
 
 SV_STOP = set("""
@@ -169,11 +172,42 @@ while what how which who whom whose do does did done make made say said see saw
 know knew think thought want need should would could can will shall
 """.split())
 
-# strong target-language letters; å is essentially unique to Nordic scripts,
-# ä/ö are milder (also German). Romance-language accents below never include å,
-# so they help tell a Swedish diacritic apart from a French/base-language one.
-SV_CHARS = set("åäö")
-BASE_CHARS = set("àâçéèêëîïôûùüÿœæ")  # Romance/base-language accents (no å)
+ES_STOP = set("""
+el la los las un una unos unas de del a al y que qué quién quien cómo como cuándo
+cuando dónde donde porque pero si sí no ni más menos muy bien mal yo tú él ella
+nosotros vosotros ellos ellas me te se le lo nos os les mi tu su mis tus sus este
+esta esto estos estas ese esa eso aquel aquella para por con sin sobre entre
+hasta desde hacia según es son está están ser estar hay tiene tener hacer hace
+dice decir puede poder todo todos toda todas nada algo alguien también ya aún
+todavía entonces así aquí allí ahí ahora hoy mañana ayer cada cual cuánto
+""".split())
+
+LV_STOP = set("""
+un ir es tu viņš viņa mēs jūs viņi viņas tas tā tie tās šis šī šie šīs ar bez par
+uz no līdz pēc pirms pie priekš ne nē jā ka kas kur kad kā kāpēc kādēļ jo bet vai
+arī tikai vēl jau tagad šodien rīt vakar ļoti daudz maz labi slikti man tev sev
+viņam viņai mums jums esmu esi esam esat var varēt būt biju biji bija bijām būs
+būšu tiek tika darīt dara saka teikt zināt gribu gribēt vajag šeit tur tad tāpēc
+tāpat kaut nekas neviens katrs viss visi visa visas
+""".split())
+
+# Stopword lexicons by language code. A language is measurable iff listed here;
+# the target is scored against every other lexicon as the "not-target" bucket.
+LEXICONS = {"sv": SV_STOP, "fr": FR_STOP, "en": EN_STOP, "es": ES_STOP, "lv": LV_STOP}
+
+# Distinctive letters/marks per language: a light boost to that language's score
+# where they appear. Only characters that rarely occur in the others, so they
+# disambiguate rather than muddy. å marks Swedish, French accents keep French
+# from looking Swedish, ñ/¿/¡ mark Spanish, macrons and carons mark Latvian.
+LANG_CHARS = {
+    "sv": set("åäö"),
+    "fr": set("àâçéèêëîïôûùÿœæ"),
+    "es": set("ñáíóú¿¡"),
+    "lv": set("āčēģīķļņšūž"),
+    "en": set(),
+}
+
+MEASURABLE = set(LEXICONS)
 
 WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 SENT_SPLIT = re.compile(r"(?<=[.!?…:;])\s+|\n+")
@@ -189,14 +223,16 @@ def _strip_noise(text):
     return text
 
 
-def classify_prose(text):
-    """Return (target_chars, total_chars) — char-weighted target-language mass.
-
-    Target is Swedish by lexicon here; the stopword sets above define it. Only
-    natural prose counts: code fences, inline code and URLs are stripped first.
+def classify_prose(text, target):
+    """Return (target_chars, total_chars): char-weighted mass of prose in the
+    target language. Each sentence is scored against every known lexicon plus a
+    per-language diacritic boost, and counts toward the target only when the
+    target wins with a real signal. Code fences, inline code and URLs stripped.
     """
+    if target not in LEXICONS:
+        return 0, 0
     text = _strip_noise(text or "")
-    sv_chars = 0
+    tgt_chars = 0
     total = 0
     for sent in SENT_SPLIT.split(text):
         sent = sent.strip()
@@ -205,26 +241,21 @@ def classify_prose(text):
         toks = [t.lower() for t in WORD_RE.findall(sent)]
         if not toks:
             continue
-        sv = sum(1 for t in toks if t in SV_STOP)
-        fr = sum(1 for t in toks if t in FR_STOP)
-        en = sum(1 for t in toks if t in EN_STOP)
         low = sent.lower()
-        sv_char_hit = sum(1 for c in low if c in SV_CHARS)
-        base_char_hit = sum(1 for c in low if c in BASE_CHARS)
-        # å is a hard Swedish tell; ä/ö count only with no base-language accents
-        if "å" in low:
-            sv += 2
-        elif sv_char_hit and not base_char_hit:
-            sv += 1
-        fr += min(base_char_hit, 3)
-        scores = {"sv": sv, "fr": fr, "en": en}
+        scores = {}
+        for code, lex in LEXICONS.items():
+            score = sum(1 for t in toks if t in lex)
+            chars = LANG_CHARS.get(code)
+            if chars:
+                score += min(sum(1 for c in low if c in chars), 3)
+            scores[code] = score
         best = max(scores, key=scores.get)
         weight = len(sent)
         total += weight
         # require a real signal; an all-unknown sentence is not counted as target
-        if best == "sv" and sv > 0:
-            sv_chars += weight
-    return sv_chars, total
+        if best == target and scores[target] > 0:
+            tgt_chars += weight
+    return tgt_chars, total
 
 
 HELP_RE = re.compile(
@@ -476,13 +507,14 @@ def cmd_monitor(args):
         msgs, end_byte = read_transcript(transcript, start)
         s.setdefault("sessions", {})[session_id] = end_byte
 
+        target = s["target"]
         for role, text in msgs:
             if role == "assistant":
-                sv, tot = classify_prose(text)
+                sv, tot = classify_prose(text, target)
                 a_sv += sv
                 a_tot += tot
             else:  # user
-                sv, tot = classify_prose(text)
+                sv, tot = classify_prose(text, target)
                 u_sv += sv
                 u_tot += tot
                 if HELP_RE.search(text):
@@ -614,11 +646,11 @@ def cmd_init(args):
     s.setdefault("pct", DEFAULTS["pct"])
     save_state(s)
     print(f"languageme: target set to {lang} ({s['target_name']}), blend {s['pct']}%")
-    if lang != "sv":
-        print("note: the prose classifier ships Swedish/French/English lexicons. "
-              "Measurement of other targets needs their stopword set added to the "
-              "script (SV_STOP-style). The drip/preprompt works for any language.",
-              file=sys.stderr)
+    if lang not in MEASURABLE:
+        print(f"note: measurable targets are {', '.join(sorted(MEASURABLE))}. "
+              f"'{lang}' has no lexicon yet, so the drip and statusline work but "
+              "the % stays 0 (add a stopword set to LEXICONS to measure it). The "
+              "preprompt works for any language.", file=sys.stderr)
     return 0
 
 
@@ -843,6 +875,32 @@ def cmd_uninstall(args):
     return 0
 
 
+def cmd_update(args):
+    """Self-update: fast-forward pull the tool's own git checkout."""
+    repo = os.path.dirname(SELF_PATH)
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        print(f"languageme: {repo} is not a git checkout, update it manually.",
+              file=sys.stderr)
+        return 1
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:
+        print(f"languageme: update failed: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write(out.stdout)
+    if out.returncode != 0:
+        sys.stderr.write(out.stderr)
+        return out.returncode
+    if "Already up to date" in out.stdout:
+        print("languageme: already up to date.")
+    else:
+        print("languageme: updated. Hooks call the same path, so it's live now.")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
@@ -872,7 +930,9 @@ USAGE = """languageme — progressive language-immersion drip for Claude Code
   languageme on                 resume the drip
   languageme install            wire the hooks + statusline into settings.json
   languageme uninstall          remove them, restore the original statusline
+  languageme update             self-update (git pull the tool's checkout)
 
+Measurable targets: sv, fr, en, es, lv. Others get the drip but no % yet.
 Hard kill (single shell/session, overrides everything): export {kill}=1
 State: {state}
 """.format(state=STATE_PATH, kill=KILL_ENV)
@@ -894,6 +954,7 @@ DISPATCH = {
     "on": cmd_on,
     "install": cmd_install,
     "uninstall": cmd_uninstall,
+    "update": cmd_update,
 }
 
 

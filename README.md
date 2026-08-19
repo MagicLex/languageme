@@ -97,7 +97,9 @@ ramp mastery|calendar|manual
 lang [<code>]               show / switch target
 off | on                    pause / resume the drip (persists)
 install | uninstall         wire / unwire hooks + statusline
+update                      self-update (git pull the tool's checkout)
 
+Measurable targets: sv, es, lv. Others get the drip but no % yet.
 Hard kill for a single shell/session (overrides everything): LANGUAGEME_OFF=1
 ```
 
@@ -109,11 +111,12 @@ settings to `settings.json.languageme.bak` before its first edit.
 
 ## Notes
 
-- The prose classifier ships a Swedish lexicon plus French and English
-  discriminators for the non-target bucket. Measuring another target needs its
-  stopword set added to the script (the `SV_STOP` block). The drip and preprompt
-  work for any language out of the box, only the *measurement* half is
-  lexicon-bound.
+- Measurable targets: **sv, es, lv** (plus fr/en as discriminators). Each ships
+  a stopword lexicon and its distinctive characters in the `LEXICONS` /
+  `LANG_CHARS` registries; the target is scored against all the others. Adding a
+  language is those two entries, nothing else. The drip and preprompt work for
+  any language out of the box, only the *measurement* half is lexicon-bound (an
+  unmeasured target just holds the % at 0).
 - `install` appends its hook entries and wraps (never replaces) your statusline;
   it leaves every existing hook and statusline untouched. `uninstall` removes
   only its own and restores the original statusline.
