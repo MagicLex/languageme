@@ -62,6 +62,23 @@ Natural-language overrides always win, both directions: say "trop de suédois"
 - **on.** Every target phrase glossed. zero ambiguity, slower learning.
 - **off.** Raw, infer from context.
 
+Add `languageme phonetic on` to layer a short pronunciation respelling on the
+tricky words (the å/ä/ö vowels, sj/tj/rs clusters, silent letters), e.g.
+`sköldpadda (turtle, "HYULD-pad-da")`. Plain learner respelling, not IPA, only
+where the spelling hides the sound. Off by default; ignored when help is off.
+
+## Pause and kill switch
+
+Two levels, so you can always shut it off:
+
+- **Persistent toggle.** `languageme off` pauses the drip (no preprompt, no
+  measuring; the statusline shows `sv off`). `languageme on` resumes it. The
+  state persists across sessions.
+- **Hard kill (env).** `export LANGUAGEME_OFF=1` fully disables it for that
+  shell or session, overriding state no matter what. The hook injects nothing,
+  the monitor does nothing, and the statusline falls back to pure passthrough
+  (your original line, no segment). The guaranteed off switch.
+
 ## Commands
 
 ```
@@ -75,9 +92,13 @@ set pct|goal|floor|step <n> tune the numbers
 bump [+n]                   nudge the blend now
 goal <n>                    ceiling to ramp toward
 help on|off|auto            inline-gloss policy
+phonetic on|off             pronunciation cues on tricky words (å/ä/ö...)
 ramp mastery|calendar|manual
 lang [<code>]               show / switch target
+off | on                    pause / resume the drip (persists)
 install | uninstall         wire / unwire hooks + statusline
+
+Hard kill for a single shell/session (overrides everything): LANGUAGEME_OFF=1
 ```
 
 ## State

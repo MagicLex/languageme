@@ -59,9 +59,23 @@ DEFAULTS = {
     "ramp": "mastery",  # mastery | calendar | manual
     "streak": 0,        # consecutive ready sessions (mastery mode)
     "history": [],      # list of session measurements, most recent last
-    "sessions": {},     # session_id -> last processed transcript line index
+    "sessions": {},     # session_id -> last processed transcript byte offset
     "inner_statusline": None,  # the statusline command we wrap (None = we added a fresh one)
+    "enabled": True,    # soft on/off toggle (persists); env LANGUAGEME_OFF hard-kills
+    "phonetic": False,  # add a light pronunciation cue on tricky words (å/ä/ö etc.)
 }
+
+# Hard kill switch: any truthy value fully disables the drip for the process,
+# no matter what state says. The one guaranteed override.
+KILL_ENV = "LANGUAGEME_OFF"
+
+
+def _env_killed():
+    return os.environ.get(KILL_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _is_enabled(s):
+    return bool(s.get("enabled", True)) and not _env_killed()
 
 HISTORY_CAP = 60
 SESSIONS_CAP = 25
@@ -336,8 +350,16 @@ def build_preprompt(s):
         )
     else:  # off
         lines.append(
-            f"HELP=off: no inline glosses — use {tgt} words in context clear "
+            f"HELP=off: no inline glosses, use {tgt} words in context clear "
             "enough to infer, do not translate them."
+        )
+    if s.get("phonetic") and help_mode != "off":
+        lines.append(
+            f"PHONETIC=on: for {tgt} words whose spelling hides the sound "
+            "(the å/ä/ö vowels, sj/tj/rs clusters, silent letters), add a short "
+            "respelling cue after the gloss, e.g. `sköldpadda (turtle, "
+            "\"HYULD-pad-da\")`. Keep it a plain readable respelling for a learner, "
+            "not full IPA, and only on words that actually need it."
         )
     lines.append(
         "Do not announce or meta-comment the blend; just write naturally with "
@@ -415,6 +437,8 @@ def cmd_hook(args):
     # (without blocking) keeps the pipe tidy.
     read_stdin_json()
     s = load_state()
+    if not _is_enabled(s):
+        return 0  # paused or hard-killed: inject nothing
     print(build_preprompt(s))
     return 0
 
@@ -435,6 +459,9 @@ def cmd_monitor(args):
             print("languageme: no transcript to measure", file=sys.stderr)
         return 0
 
+    if _env_killed():
+        return 0  # hard kill: don't even touch state
+
     # load→read tail→ramp→save under one lock so parallel Stop hooks can't
     # clobber each other's append. The read is bounded to the new tail (byte
     # seek), so holding the lock across it is cheap.
@@ -443,6 +470,8 @@ def cmd_monitor(args):
 
     with state_lock():
         s = load_state()
+        if not s.get("enabled", True):
+            return 0  # paused: measure nothing
         start = 0 if "--full" in args else s.get("sessions", {}).get(session_id, 0)
         msgs, end_byte = read_transcript(transcript, start)
         s.setdefault("sessions", {})[session_id] = end_byte
@@ -493,9 +522,18 @@ def cmd_monitor(args):
 
 def cmd_status(args):
     s = load_state()
+    if _env_killed():
+        active = f"HARD-KILLED ({KILL_ENV} set in this shell)"
+    elif not s.get("enabled", True):
+        active = "paused (languageme on to resume)"
+    else:
+        active = "on"
+    print(f"active     : {active}")
     print(f"target     : {s['target']} ({s['target_name']})")
     print(f"blend      : {s['pct']}%  (floor {s['floor']} · goal {s['goal']} · step {s['step']})")
-    print(f"ramp       : {s['ramp']}   help: {s['help']}   streak: {s.get('streak', 0)}")
+    print(f"ramp       : {s['ramp']}   help: {s['help']}   "
+          f"phonetic: {'on' if s.get('phonetic') else 'off'}   "
+          f"streak: {s.get('streak', 0)}")
     hist = s.get("history", [])
     if hist:
         last = hist[-3:]
@@ -520,7 +558,9 @@ def cmd_status(args):
 
 
 def _segment(s):
-    """The languageme statusline segment, e.g. 'sv 12%↑ ~11'."""
+    """The languageme statusline segment, e.g. 'sv 12%↑ ~11' (or 'sv off')."""
+    if not s.get("enabled", True):
+        return f"{s['target']} off"
     hist = s.get("history", [])
     arrow = ""
     m = ""
@@ -555,7 +595,9 @@ def cmd_statusline(args):
                 parts.append(out)
         except Exception:
             pass  # a broken inner statusline must never blank the whole line
-    parts.append(_segment(s))
+    # hard kill: pure passthrough, no segment at all. otherwise append ours.
+    if not _env_killed():
+        parts.append(_segment(s))
     print("  │  ".join(p for p in parts if p))
     return 0
 
@@ -641,6 +683,42 @@ def cmd_ramp(args):
 
 def cmd_goal(args):
     return cmd_set(["goal"] + list(args))
+
+
+def cmd_off(args):
+    with state_lock():
+        s = load_state()
+        s["enabled"] = False
+        save_state(s)
+    print("languageme: paused. No drip injected, no measuring, statusline shows "
+          f"'{load_state()['target']} off'. Resume with `languageme on`.")
+    print(f"(hard kill for a single shell/session: export {KILL_ENV}=1)")
+    return 0
+
+
+def cmd_on(args):
+    with state_lock():
+        s = load_state()
+        s["enabled"] = True
+        save_state(s)
+    if _env_killed():
+        print(f"languageme: enabled in state, but {KILL_ENV} is set in this "
+              "environment and still hard-kills it here.")
+    else:
+        print("languageme: resumed. Drip loads on the next session (or /clear).")
+    return 0
+
+
+def cmd_phonetic(args):
+    if not args or args[0] not in ("on", "off"):
+        print("usage: languageme phonetic <on|off>", file=sys.stderr)
+        return 1
+    with state_lock():
+        s = load_state()
+        s["phonetic"] = args[0] == "on"
+        save_state(s)
+    print(f"languageme: phonetic = {'on' if s['phonetic'] else 'off'}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -786,14 +864,18 @@ USAGE = """languageme — progressive language-immersion drip for Claude Code
   languageme bump [+n]          nudge the blend now (default = one step)
   languageme goal <n>           set the ceiling to ramp toward
   languageme help on|off|auto   inline-gloss policy
+  languageme phonetic on|off    add pronunciation cues on tricky words (å/ä/ö...)
   languageme ramp mastery|calendar|manual   how the % grows
   languageme lang [<code>]      show / switch target language
 
+  languageme off                pause the drip (persists; statusline shows 'off')
+  languageme on                 resume the drip
   languageme install            wire the hooks + statusline into settings.json
   languageme uninstall          remove them, restore the original statusline
 
+Hard kill (single shell/session, overrides everything): export {kill}=1
 State: {state}
-""".format(state=STATE_PATH)
+""".format(state=STATE_PATH, kill=KILL_ENV)
 
 DISPATCH = {
     "init": cmd_init,
@@ -805,8 +887,11 @@ DISPATCH = {
     "bump": cmd_bump,
     "goal": cmd_goal,
     "help": cmd_help_mode,
+    "phonetic": cmd_phonetic,
     "ramp": cmd_ramp,
     "lang": cmd_lang,
+    "off": cmd_off,
+    "on": cmd_on,
     "install": cmd_install,
     "uninstall": cmd_uninstall,
 }
