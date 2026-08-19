@@ -309,10 +309,18 @@ def classify_prose(text, target):
     return tgt_chars, total
 
 
+# The user asking for rescue from the immersion: switch back to the base
+# language, gloss a word, or say it is too much. Every branch is anchored to
+# that intent, so ordinary coding talk ("translate the config", "I don't
+# understand this trace", "what does this return", "the query is slower") does
+# NOT trip it and stall the mastery ramp. Bare verbs (translate/understand)
+# were the false positives; dropped in favour of switch-back and gloss phrasing.
 HELP_RE = re.compile(
-    r"traduis|translate|en fran[çc]ais|in english|what does|ça veut dire|"
-    r"c'?est quoi|comprends pas|understand|slower|plus lentement|"
-    r"trop de su[ée]dois|too much sw|för mycket",
+    r"\bin english\b|\ben fran[çc]ais\b|"                        # switch me back
+    r"\bwhat does\b[^.?!]{0,40}\bmean\b|\bça veut dire\b|\bc'?est quoi\b|"  # gloss a word
+    r"\bcomprends pas\b|\btraduis\b|"                            # explicit FR help
+    r"\bplus lentement\b|\bralentis\b|"                          # slow the pace
+    r"trop de su[ée]dois|too much swedish|för mycket",           # too much target
     re.IGNORECASE,
 )
 BACKOFF_RE = re.compile(
