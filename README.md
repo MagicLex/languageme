@@ -23,24 +23,41 @@ Three layers, wired as two Claude Code hooks plus a statusline segment:
   sentence-level classifier, no ML dependency), tracks whether you asked for
   help or wrote the language yourself, and moves N per the ramp policy.
 
-A **statusline segment** (`sv 12%↑ ~11`: target, current blend, last measured)
-rides along so you always see where the dial is. `install` wires it
-non-destructively: if you already have a statusline it wraps it and appends the
-segment, if you don't it adds one. It never edits or replaces your statusline.
+A **statusline segment** rides along so you always see where the dial is.
+Reading `sv 12%↑ ~11`:
 
-The blend only ever grows when the drip is landing and you're not drowning.
+- `sv` : target language
+- `12%` : current blend target (what the preprompt aims for)
+- `↑` : the gauge just moved up on the last turn (`↓` down, nothing = steady)
+- `~11` : the *real* share of target language measured on the last turn (`~` =
+  roughly). No `~N` yet means no turn has been measured.
+
+`install` wires it non-destructively: if you already have a statusline it wraps
+it and appends the segment, if you don't it adds one. It never edits or replaces
+your statusline.
+
+The blend only ever grows when the real measured share holds the target and you
+are not asking for help.
 
 ## Quick start
 
 ```sh
 ./languageme init sv          # seed Swedish at 10%
 ./languageme install          # wire hooks + statusline (edits ~/.claude/settings.json)
-# start a new Claude Code session, the drip is live
 ./languageme status           # target, blend %, recent measurements, ramp state
 ```
 
+The preprompt loads at SessionStart, so the drip starts on your **next** Claude
+Code session. To activate it in the current one without leaving, run `/clear`
+(it re-fires SessionStart). Until the first turn is measured the statusline
+shows the target with no `~N`, and the gauge stays put; the `~N` and any ramp
+appear once a turn has run under the drip.
+
 Put it on your PATH if you like: `ln -s "$PWD/languageme" ~/bin/languageme`.
 The hooks call it by absolute path, so a symlink is optional.
+
+Switch target any time: `languageme lang sv|es|lv`. The gauge and ramp follow
+the new language.
 
 ## Ramp policies (`languageme ramp <mode>`)
 
