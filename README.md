@@ -4,7 +4,7 @@
 
 # languageme
 
-*langua J'aime*
+*/ˈlæŋɡwə ʒɛm/*
 
 A progressive language-immersion drip for Claude Code. It preprompts, forces
 and monitors how much of each reply comes back in a target language, and ramps
