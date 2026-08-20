@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="languageme" width="640">
+</p>
+
 # languageme
 
 A progressive language-immersion drip for Claude Code. It preprompts, forces
