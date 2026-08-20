@@ -4,6 +4,8 @@
 
 # languageme
 
+*langua J'aime*
+
 A progressive language-immersion drip for Claude Code. It preprompts, forces
 and monitors how much of each reply comes back in a target language, and ramps
 that share up on evidence you're keeping up, not on a calendar.
