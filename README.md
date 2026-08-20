@@ -2,9 +2,7 @@
   <img src="assets/logo.png" alt="languageme" width="640">
 </p>
 
-# languageme
-
-*/ˈlæŋɡwə ʒɛm/*
+<p align="center"><em>/ˈlæŋɡwə ʒɛm/</em></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-black" alt="MIT license">
