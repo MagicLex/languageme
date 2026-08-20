@@ -20,20 +20,28 @@ a hard language switch.
 
 ## How it works
 
-Three layers, wired as two Claude Code hooks plus a statusline segment:
+Four layers, wired as three Claude Code hooks plus a statusline segment:
 
-- **Preprompt (SessionStart hook).** `languageme hook` injects "render ~N% of
-  your prose in Swedish, keep the rest in your usual reply language" into every
-  new session. N lives in state. The target language is confined to chat prose,
-  never code, commits, filenames, tool arguments, or any clause where a wrong
-  word breaks something.
-- **Force.** The injected rule is explicit and self-limiting: meaning stays
-  recoverable, precise technical claims stay in your usual language.
+- **Preprompt (SessionStart hook).** `languageme hook` injects the drip into
+  every new session: blend ~N% of your prose into the target, keep the rest in
+  your usual reply language. It states N as a concrete per-paragraph quantum
+  (a model cannot self-calibrate a raw percentage) and tells you to judge each
+  reply against the target, not against your own earlier replies. N lives in
+  state. The target is confined to chat prose, never code, commits, filenames,
+  tool arguments, or any clause where a wrong word breaks something.
+- **Nudge (UserPromptSubmit hook).** `languageme nudge` closes the loop the
+  one-shot preprompt cannot. Before each reply it injects one live line from the
+  previous turn's measured blend: `last reply 80% vs ~16% target, well over,
+  one short phrase per paragraph`. This re-asserts the target every turn (immune
+  to context growth) and corrects both overshoot and full dropout, the two ways
+  an open-loop drip drifts.
 - **Monitor (Stop hook).** `languageme monitor` reads the finished transcript,
   measures the *real* target-language share you produced (char-weighted,
   per-token classifier that reads the intra-sentence blend, no ML dependency),
   tracks whether you asked for help or wrote the language yourself, and moves N
-  per the ramp policy.
+  per the ramp policy. The ramp reads the session-cumulative blend and gates on
+  a *band*: too much target counts as noncompliance, not mastery, so overshoot
+  never ramps N up.
 
 A **statusline segment** rides along so you always see where the dial is.
 Reading `sv 12%↑ ~11`:
@@ -73,9 +81,11 @@ the new language.
 
 ## Ramp policies (`languageme ramp <mode>`)
 
-- **mastery** (default). Ramps one step after 3 consecutive sessions where you
-  produced the target blend and asked for zero help. Writing the language
-  yourself adds a bonus step. Asking for help resets the streak.
+- **mastery** (default). Ramps one step after 3 distinct sessions whose
+  cumulative blend lands in the target band (not too little, not too much) with
+  zero help asked. Each session counts once, however many turns it ran. Writing
+  the language yourself adds a bonus step. Overshoot or asking for help resets
+  the streak.
 - **calendar.** One step per monitored session until the goal. Hands-off, blind
   to whether you're keeping up.
 - **manual.** Never auto-moves. You bump it: `languageme bump +5`.

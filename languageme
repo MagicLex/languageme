@@ -8,6 +8,7 @@ evidence (mastery-gated), not on a calendar.
 
 Standalone: one file, stdlib only, no pip installs. Wire it into Claude Code
 with `languageme install`: a SessionStart hook that injects the preprompt, a
+UserPromptSubmit hook that re-steers each turn from the last measured blend, a
 Stop hook that measures the finished turn, and a statusline segment that
 augments whatever statusline you already have (never replaces it).
 
@@ -59,9 +60,10 @@ DEFAULTS = {
     "step": 3,          # ramp increment / decrement
     "help": "auto",     # auto | on | off
     "ramp": "mastery",  # mastery | calendar | manual
-    "streak": 0,        # consecutive ready sessions (mastery mode)
+    "streak": 0,        # consecutive ready SESSIONS (mastery); gated by streak_sid
+    "streak_sid": None, # session id that last credited the streak (dedupe per session)
     "history": [],      # list of session measurements, most recent last
-    "sessions": {},     # session_id -> last processed transcript byte offset
+    "sessions": {},     # session_id -> {offset, cum_sv, cum_tot, cum_help, measured, self}
     "inner_statusline": None,  # the statusline command we wrap (None = we added a fresh one)
     "enabled": True,    # soft on/off toggle (persists); env LANGUAGEME_OFF hard-kills
     "phonetic": False,  # add a light pronunciation cue on tricky words (å/ä/ö etc.)
@@ -81,6 +83,18 @@ def _is_enabled(s):
 
 HISTORY_CAP = 60
 SESSIONS_CAP = 25
+
+
+def _session_entry(s, sid):
+    """The per-session record, migrating the old bare-int (byte offset) form to
+    the current dict {offset, cum_sv, cum_tot, cum_help, measured, self}. Returns
+    a dict the caller writes back into s['sessions'][sid]."""
+    e = s.setdefault("sessions", {}).get(sid)
+    if isinstance(e, int):
+        return {"offset": e}
+    if isinstance(e, dict):
+        return e
+    return {}
 
 
 def load_state():
@@ -226,6 +240,12 @@ FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
 URL_RE = re.compile(r"https?://\S+|\b[\w.-]+\.[a-z]{2,}(?:/\S*)?", re.IGNORECASE)
 
+# How far an undecided token may inherit a decided neighbour's language. An
+# unbounded fill let a long English run inside a target-framed sentence inherit
+# the target and read as ~100%; capping keeps distant undecided tokens in the
+# 'not target' bucket, deflating that spurious inflation.
+FILL_CAP = 3
+
 
 def _strip_noise(text):
     text = FENCE_RE.sub(" ", text)
@@ -272,19 +292,28 @@ def _classify_sentence(sent, target):
     weights[0] += matches[0].start()  # leading chars → first token
 
     labels = [_decide_token(m.group().lower()) for m in matches]
-    # forward fill (attach to preceding decision), then backward for the lead run
-    last = None
+    # Attach each undecided token to its nearest decided neighbour, but only
+    # across a short gap (FILL_CAP): forward for the preceding decision, then
+    # backward for the leading run. Beyond the cap a token stays undecided and
+    # falls to the 'not target' bucket, so a long off-language run can't inherit.
+    last, gap = None, 0
     for i in range(n):
         if labels[i] is not None:
-            last = labels[i]
-        elif last is not None:
+            last, gap = labels[i], 0
+        elif last is not None and gap < FILL_CAP:
             labels[i] = last
-    nxt = None
+            gap += 1
+        else:
+            gap += 1
+    nxt, gap = None, 0
     for i in range(n - 1, -1, -1):
         if labels[i] is not None:
-            nxt = labels[i]
-        elif nxt is not None:
+            nxt, gap = labels[i], 0
+        elif nxt is not None and gap < FILL_CAP:
             labels[i] = nxt
+            gap += 1
+        else:
+            gap += 1
 
     tgt = sum(w for w, lab in zip(weights, labels) if lab == target)
     return tgt, sum(weights)
@@ -442,17 +471,34 @@ def read_transcript(path, start_byte=0):
 # Preprompt (the injected drip)
 # ---------------------------------------------------------------------------
 
+def _quantum(pct, tgt):
+    """Translate an abstract blend % into a concrete per-reply instruction. A
+    model cannot self-calibrate 'X% of prose' on a 2-sentence reply; it can act
+    on 'one phrase per paragraph'. Coarse bands on purpose."""
+    if pct <= 15:
+        return (f"Weave one or two {tgt} words, or a single short phrase, into "
+                f"each paragraph; a whole sentence in {tgt} already puts you over.")
+    if pct <= 30:
+        return f"Put roughly one sentence in four in {tgt}, the rest your usual language."
+    if pct <= 55:
+        return f"Put about every other sentence in {tgt}."
+    return (f"Lead in {tgt}, dropping to your usual language only for precise "
+            "technical claims.")
+
+
 def build_preprompt(s):
     tgt = s["target_name"]
     pct = s["pct"]
     help_mode = s["help"]
     lines = [
         "===== languageme (immersion drip) =====",
-        f"This session, render approximately {pct}% of your conversational prose "
-        f"in {tgt}; keep the rest in your usual reply language (whatever you would "
-        "normally answer in, do not switch it). This is a gradual learning drip, "
-        "favour natural high-frequency vocabulary and everyday phrasing, not "
-        "obscure words.",
+        f"This session, blend about {pct}% of your conversational prose into "
+        f"{tgt}, keeping the rest in your usual reply language (whatever you would "
+        f"normally answer in; do not switch it). {_quantum(pct, tgt)} Favour "
+        "natural high-frequency vocabulary and everyday phrasing, not obscure words.",
+        "Calibrate every reply against that target, not against your own earlier "
+        "replies: a drifted reply imitated becomes the next reply's anchor and the "
+        "blend runs away, so judge each reply fresh against the target above.",
         f"{tgt} belongs in chat prose ONLY. Never put it in code, identifiers, "
         "commit messages, file contents, shell commands, tool arguments, or any "
         "technical token where a wrong word breaks something.",
@@ -469,7 +515,8 @@ def build_preprompt(s):
         lines.append(
             f"HELP=auto: gloss unfamiliar {tgt} words on first use as "
             "`word (translation)`, and let the glosses fade as the same words "
-            f"recur, at {pct}% you can drop glosses on words already seen."
+            f"recur; at {pct}% drop glosses on words already seen. A gloss doubles "
+            f"a word's {tgt} footprint, so keep glosses terse and few."
         )
     else:  # off
         lines.append(
@@ -496,18 +543,24 @@ def build_preprompt(s):
 # Ramp policy
 # ---------------------------------------------------------------------------
 
-def apply_ramp(s, measured_pct, self_pct, help_count, backoff, more):
-    """Mutate s['pct']/s['streak'] per ramp policy. Returns a short reason str."""
+def apply_ramp(s, measured_pct, self_pct, help_count, backoff, more, sid):
+    """Mutate s['pct']/s['streak'] per ramp policy. Returns a short reason str.
+
+    measured_pct and help_count are session-CUMULATIVE (stable across the whole
+    session), not one noisy turn. Mastery credits at most one streak point per
+    distinct session, gated by s['streak_sid'], so many ready turns inside one
+    session count once, not once per Stop, and concurrent sessions don't stack.
+    """
     pct, goal, floor, step = s["pct"], s["goal"], s["floor"], s["step"]
 
-    # explicit natural-language control always wins, both directions
+    # explicit natural-language control always wins, both directions (per turn)
     if backoff:
         s["pct"] = max(floor, pct - step)
-        s["streak"] = 0
+        s["streak"], s["streak_sid"] = 0, None
         return f"backoff signal → {pct}%→{s['pct']}%"
     if more and s["ramp"] != "manual":
         s["pct"] = min(goal, pct + step)
-        s["streak"] = 0
+        s["streak"], s["streak_sid"] = 0, None
         return f"'more' signal → {pct}%→{s['pct']}%"
 
     ramp = s["ramp"]
@@ -515,36 +568,40 @@ def apply_ramp(s, measured_pct, self_pct, help_count, backoff, more):
         return "manual: pct unchanged"
 
     if ramp == "calendar":
-        # one step per monitored session, capped
-        if pct < goal:
-            s["pct"] = min(goal, pct + step)
-            return f"calendar → {pct}%→{s['pct']}%"
-        return f"calendar: at goal {goal}%"
+        # one step per monitored session (not per turn), capped
+        if pct >= goal:
+            return f"calendar: at goal {goal}%"
+        if s.get("streak_sid") == sid:
+            return f"calendar: already stepped this session, hold {pct}%"
+        s["pct"] = min(goal, pct + step)
+        s["streak_sid"] = sid
+        return f"calendar → {pct}%→{s['pct']}%"
 
-    # mastery-gated: ramp only on evidence the drip is landing and not drowning.
-    hist = s["history"][-3:]
-    compiled = measured_pct >= 0.7 * pct           # I actually produced the blend
-    not_drowning = help_count == 0                 # he didn't ask for rescue
-    ready = compiled and not_drowning
-    if ready:
+    # mastery-gated: ramp only when the cumulative blend lands in a BAND, not
+    # merely above a floor. Overshoot is noncompliance (it drove the runaway
+    # 10→13→16 self-ramp), so it resets the streak just like drowning does.
+    ceiling = max(2 * pct, pct + 10)
+    in_band = 0.7 * pct <= measured_pct <= ceiling
+    not_drowning = help_count == 0                 # no rescue asked this session
+    ready = in_band and not_drowning
+    if not ready:
+        s["streak"], s["streak_sid"] = 0, None
+        why = ("overshoot" if measured_pct > ceiling
+               else "low output" if not in_band else "help asked")
+        return f"hold {pct}% (streak reset: {why})"
+
+    # ready: credit this session once
+    if s.get("streak_sid") != sid:
         s["streak"] = s.get("streak", 0) + 1
-    else:
-        s["streak"] = 0
-        return (
-            f"hold {pct}% (streak reset: "
-            f"{'low output' if not compiled else ''}"
-            f"{'/' if not compiled and not not_drowning else ''}"
-            f"{'help asked' if not not_drowning else ''})"
-        )
+        s["streak_sid"] = sid
 
-    # need 3 consecutive ready sessions, and enough history to trust it
     need = 3
     if s["streak"] >= need and pct < goal:
         # faster step if he's writing the language himself
         bump = step + (2 if self_pct >= min(pct * 0.3, 12) else 0)
         s["pct"] = min(goal, pct + bump)
-        s["streak"] = 0
-        return f"mastery ✓ ({need} ready) → {pct}%→{s['pct']}%"
+        s["streak"] = 0  # keep streak_sid = sid so this session can't re-ramp
+        return f"mastery ✓ ({need} ready sessions) → {pct}%→{s['pct']}%"
     if pct >= goal:
         return f"mastery: at goal {goal}%"
     return f"mastery: streak {s['streak']}/{need}, hold {pct}%"
@@ -563,6 +620,47 @@ def cmd_hook(args):
     if not _is_enabled(s):
         return 0  # paused or hard-killed: inject nothing
     print(build_preprompt(s))
+    return 0
+
+
+def _nudge_line(s, measured):
+    """One live line steering the next reply. With no prior measurement (first
+    prompt of a session) it just restates the target as a concrete quantum;
+    otherwise it bands the last reply against target and corrects. Absolute
+    cushions (pct+8, pct+3, min 1) keep a small pct from jittering on rounding."""
+    tgt, pct = s["target_name"], s["pct"]
+    quantum = _quantum(pct, tgt)
+    if measured is None:
+        return f"languageme drip: aim ~{pct}% {tgt} this session. {quantum}"
+    if measured > max(1.6 * pct, pct + 8):
+        advice = (f"Well over target. This reply: at most one short {tgt} phrase "
+                  f"per paragraph, no full {tgt} sentences.")
+    elif measured > max(1.2 * pct, pct + 3):
+        advice = f"A touch high. Trim to a word or short phrase of {tgt} per paragraph."
+    elif measured >= 0.55 * pct:
+        advice = "On target, hold this level."
+    elif measured >= max(0.15 * pct, 1):
+        advice = f"A bit light. Add a {tgt} word or short phrase."
+    else:
+        advice = f"You've dropped the drip. Weave {tgt} back in. {quantum}"
+    return f"languageme drip: last reply {measured:.0f}% {tgt} vs ~{pct}% target. {advice}"
+
+
+def cmd_nudge(args):
+    """UserPromptSubmit hook: inject one live line steering the NEXT reply toward
+    target, from the previous turn's measured blend. Closes the loop the one-shot
+    SessionStart preprompt cannot: the target is re-asserted every prompt (immune
+    to context growth and drift) with fresh, banded correction."""
+    stdin_json = read_stdin_json()
+    sid = stdin_json.get("session_id", "")
+    s = load_state()
+    if not _is_enabled(s):
+        return 0
+    if s["target"] not in MEASURABLE:
+        print(_nudge_line(s, None))  # unmeasurable target: restate target only
+        return 0
+    entry = _session_entry(s, sid)
+    print(_nudge_line(s, entry.get("measured")))
     return 0
 
 
@@ -595,9 +693,9 @@ def cmd_monitor(args):
         s = load_state()
         if not s.get("enabled", True):
             return 0  # paused: measure nothing
-        start = 0 if "--full" in args else s.get("sessions", {}).get(session_id, 0)
+        entry = _session_entry(s, session_id)
+        start = 0 if "--full" in args else entry.get("offset", 0)
         msgs, end_byte = read_transcript(transcript, start)
-        s.setdefault("sessions", {})[session_id] = end_byte
 
         target = s["target"]
         help_re, backoff_re, more_re = _control_res(target)
@@ -617,17 +715,34 @@ def cmd_monitor(args):
                 if more_re.search(text):
                     more = True
 
+        # per-turn (this tail): drives the live nudge on the NEXT prompt
         measured = round(100 * a_sv / a_tot, 1) if a_tot else 0.0
         self_pct = round(100 * u_sv / u_tot, 1) if u_tot else 0.0
 
+        # session-cumulative: drives the ramp (stable, not one-turn noise).
+        # start==0 (fresh session or --full replay) resets the running totals.
+        base_sv = 0 if start == 0 else entry.get("cum_sv", 0)
+        base_tot = 0 if start == 0 else entry.get("cum_tot", 0)
+        base_help = 0 if start == 0 else entry.get("cum_help", 0)
+        cum_sv, cum_tot, cum_help = base_sv + a_sv, base_tot + a_tot, base_help + help_count
+        cum_measured = round(100 * cum_sv / cum_tot, 1) if cum_tot else 0.0
+
+        entry.update({
+            "offset": end_byte,
+            "cum_sv": cum_sv, "cum_tot": cum_tot, "cum_help": cum_help,
+            "measured": measured, "self": self_pct,
+        })
+        s.setdefault("sessions", {})[session_id] = entry
+
         prev_pct = s["pct"]
-        reason = apply_ramp(s, measured, self_pct, help_count, backoff, more)
+        reason = apply_ramp(s, cum_measured, self_pct, cum_help, backoff, more, session_id)
 
         s["history"].append({
             "session": session_id[:8],
             "target": s["target"],
             "pct_target": prev_pct,
             "measured": measured,
+            "cum": cum_measured,
             "self": self_pct,
             "help": help_count,
             "new_target": s["pct"],
@@ -637,8 +752,8 @@ def cmd_monitor(args):
     if "--quiet" not in args:
         arrow = "↑" if s["pct"] > prev_pct else ("↓" if s["pct"] < prev_pct else "=")
         print(
-            f"languageme [{s['target']}] measured {measured}% "
-            f"(target {prev_pct}%, self {self_pct}%, help {help_count}) "
+            f"languageme [{s['target']}] turn {measured}% / session {cum_measured}% "
+            f"(target {prev_pct}%, self {self_pct}%, help {cum_help}) "
             f"→ {s['pct']}%{arrow}  |  {reason}",
             file=sys.stderr,
         )
@@ -919,6 +1034,7 @@ def cmd_install(args):
     hooks = st.setdefault("hooks", {})
     changed = False
     changed |= _add_hook(hooks, "SessionStart", f'"{SELF_PATH}" hook')
+    changed |= _add_hook(hooks, "UserPromptSubmit", f'"{SELF_PATH}" nudge')
     changed |= _add_hook(hooks, "Stop", f'"{SELF_PATH}" monitor --quiet', matcher="")
     sl_changed = _wire_statusline(st, s)
     changed |= sl_changed
@@ -934,7 +1050,7 @@ def cmd_install(args):
         save_state(s)  # persist inner_statusline
     sl_note = ("augmented existing statusline"
                if s.get("inner_statusline") else "added a statusline")
-    print(f"languageme: wired SessionStart + Stop hooks in {SETTINGS_PATH}")
+    print(f"languageme: wired SessionStart + UserPromptSubmit + Stop hooks in {SETTINGS_PATH}")
     print(f"            statusline: {sl_note} (existing entries left untouched)")
     print("Start a new Claude Code session to load the drip.")
     return 0
@@ -945,7 +1061,7 @@ def cmd_uninstall(args):
     s = load_state()
     hooks = st.get("hooks", {})
     removed = False
-    for event in ("SessionStart", "Stop"):
+    for event in ("SessionStart", "UserPromptSubmit", "Stop"):
         arr = hooks.get(event, [])
         new = []
         for grp in arr:
@@ -1006,6 +1122,7 @@ USAGE = """languageme: progressive language-immersion drip for Claude Code
       --wrap                      run the wrapped statusline, append our segment
 
   languageme hook               [SessionStart] print the preprompt to inject
+  languageme nudge              [UserPromptSubmit] live per-turn steer to target
   languageme monitor            [Stop] measure the finished turn, ramp the %
       --session <path>            measure a specific transcript (manual)
       --full                      re-measure the whole transcript, not just new lines
@@ -1035,6 +1152,7 @@ DISPATCH = {
     "status": cmd_status,
     "statusline": cmd_statusline,
     "hook": cmd_hook,
+    "nudge": cmd_nudge,
     "monitor": cmd_monitor,
     "set": cmd_set,
     "bump": cmd_bump,
