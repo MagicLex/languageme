@@ -6,6 +6,13 @@
 
 */ˈlæŋɡwə ʒɛm/*
 
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-black" alt="MIT license">
+  <img src="https://img.shields.io/badge/python-3-black" alt="Python 3">
+  <img src="https://img.shields.io/badge/deps-zero%20·%20stdlib%20only-black" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/Claude%20Code-hook-black" alt="Claude Code hook">
+</p>
+
 A progressive language-immersion drip for Claude Code. It preprompts, forces
 and monitors how much of each reply comes back in a target language, and ramps
 that share up on evidence you're keeping up, not on a calendar.
